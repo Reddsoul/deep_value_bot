@@ -1,44 +1,70 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import numpy as np
 import pandas as pd
 
 from paper_broker import Broker, Market, Strategy
-from Deep_Value_Bot import run_screen
+from Deep_Value_Bot import run_screen, GRAHAM_CONFIG
 
 
 class DeepValueStrategy(Strategy):
     """
-    Simple long-only equal-weight deep value strategy that wraps your screener.
+    Graham-style long-only deep value strategy.
 
     Behavior
     --------
     - On start:
-        - Receives the full trading calendar (list of timestamps).
+        - Receives the full trading calendar.
     - On each bar:
-        - Runs the deep value screen for that as-of date.
-        - Ranks candidates by `score` (lower = cheaper).
-        - Intersects candidates with the symbols that actually exist in the
-          backtest price universe (so we only trade names we have data for).
-        - Rebalances the portfolio into the top `max_positions` names, with
-          equal dollar weights.
+        - Only acts on rebalance dates (every `rebalance_every_n_days`).
+        - Calls run_screen(as_of_date=ts, mode="raw") to get full metrics and
+          filter flags.
+        - Applies explicit exit rules:
+            * Sell if:
+                - p_tangible_book > MAX_P_TANGIBLE_BOOK_EXIT or
+                - ncav_ratio < MIN_NCAV_RATIO_EXIT
+              AND the minimum holding period has been satisfied; OR
+                - quality_pass == False (immediate exit), OR
+                - fundamentals missing and EXIT_ON_MISSING_FUNDAMENTALS = True.
+        - After forced sells:
+            * Keeps remaining holdings.
+            * If there are empty slots (< max_positions), selects new entries
+              from names where passes_all == True, sorted by score (cheapest).
+            * Rebalances into equal-weight positions over current holdings
+              plus new entries.
+        - If nothing qualifies, it happily holds cash and existing positions.
     - On end:
         - Optionally liquidates all remaining positions so P&L is realized.
     """
 
-    def __init__(self,
-                universe=None,
-                max_positions=20,
-                rebalance_every_n_days=1,
-                liquidate_on_end=True):
-        self.universe = universe  # <-- add this
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        max_positions: int = 20,
+        rebalance_every_n_days: int = 63,  # ~ quarterly by default
+        min_holding_days: int = 180,
+        liquidate_on_end: bool = True,
+        config_overrides: Optional[Dict[str, object]] = None,
+    ) -> None:
+        self.universe = universe
         self.max_positions = int(max_positions)
         self.rebalance_every_n_days = int(rebalance_every_n_days)
+        self.min_holding_days = int(min_holding_days)
         self.liquidate_on_end = bool(liquidate_on_end)
-        self.calendar = []
-        self._last_rebalance_idx = None
+
+        # Calendar / bookkeeping
+        self.calendar: List[pd.Timestamp] = []
+        self._last_rebalance_idx: Optional[int] = None
+
+        # Entry dates for minimum holding period logic
+        self.entry_dates: Dict[str, pd.Timestamp] = {}
+
+        # Thresholds (per-instance override of global config if desired)
+        self.cfg = dict(GRAHAM_CONFIG)
+        if config_overrides:
+            self.cfg.update(config_overrides)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -61,6 +87,13 @@ class DeepValueStrategy(Strategy):
                 equity += pos.quantity * price
         return float(equity)
 
+    def _days_held(self, symbol: str, ts: pd.Timestamp) -> Optional[int]:
+        """Return number of calendar days symbol has been held (None if unknown)."""
+        entry_ts = self.entry_dates.get(str(symbol))
+        if entry_ts is None:
+            return None
+        return (pd.to_datetime(ts).normalize() - entry_ts.normalize()).days
+
     # ------------------------------------------------------------------
     # Strategy interface
     # ------------------------------------------------------------------
@@ -72,9 +105,12 @@ class DeepValueStrategy(Strategy):
     ) -> None:
         self.calendar = [pd.to_datetime(d) for d in calendar]
         self._last_rebalance_idx = None
+        self.entry_dates.clear()
         print(
             f"[DeepValueStrategy] Starting backtest with {len(self.calendar)} bars, "
-            f"max_positions={self.max_positions}, rebalance_every_n_days={self.rebalance_every_n_days}"
+            f"max_positions={self.max_positions}, "
+            f"rebalance_every_n_days={self.rebalance_every_n_days}, "
+            f"min_holding_days={self.min_holding_days}"
         )
 
     def on_bar(
@@ -85,19 +121,15 @@ class DeepValueStrategy(Strategy):
         slice_df: pd.DataFrame,
     ) -> None:
         """
-        Rebalance into top deep-value names on this bar.
-
-        This calls `run_screen(as_of_date=ts)` to get candidates, then
-        intersects them with the symbols that actually have price history
-        in the backtest (slice_df.columns). Only those names are eligible
-        to trade.
+        Graham-style rebalance logic with explicit entry/exit rules and
+        willingness to hold cash.
         """
         ts = pd.to_datetime(ts)
         bar_idx = self._idx_for_ts(ts)
         if bar_idx is None:
             return
 
-        # Rebalance only every Nth bar
+        # Only rebalance every Nth bar
         if (
             self.rebalance_every_n_days > 1
             and self._last_rebalance_idx is not None
@@ -106,26 +138,31 @@ class DeepValueStrategy(Strategy):
             return
 
         # ---------------------------
-        # 1) Run deep value screen
+        # 1) Run deep value screen (raw)
         # ---------------------------
         try:
-            screen_df = run_screen(as_of_date=ts, universe_override=self.universe)
+            screen_df = run_screen(
+                as_of_date=ts,
+                universe_override=self.universe,
+                mode="raw",
+            )
         except Exception as e:
             print(f"[DeepValueStrategy] run_screen failed on {ts.date()}: {e}")
             return
 
         if screen_df is None or screen_df.empty:
+            print("[DeepValueStrategy] Screener returned no data; skipping bar.")
             return
 
-        # Ensure we have a symbol column
+        # Identify symbol column
         symbol_col = None
-        for c in ["symbol", "ticker", "Symbol", "Ticker"]:
+        for c in ["ticker", "symbol", "Symbol", "Ticker"]:
             if c in screen_df.columns:
                 symbol_col = c
                 break
 
         if symbol_col is None:
-            print("[DeepValueStrategy] Screener output missing symbol/ticker column, skipping bar.")
+            print("[DeepValueStrategy] Screener output missing symbol/ticker column; skipping bar.")
             return
 
         # Restrict candidates to symbols that exist in our price universe
@@ -135,65 +172,135 @@ class DeepValueStrategy(Strategy):
             screen_df = screen_df[
                 screen_df[symbol_col].astype(str).isin(traded_universe)
             ].copy()
+            after_ct = len(screen_df)
+            print(
+                f"[DeepValueStrategy] Universe restricted to traded names: "
+                f"{before_ct} -> {after_ct}"
+            )
             if screen_df.empty:
                 print(
                     f"[DeepValueStrategy] Screener produced {before_ct} names on {ts.date()} "
-                    "but none are in the price universe used by the backtest; skipping bar."
+                    "but none are in the price universe; skipping bar."
                 )
                 return
 
-        # Ensure we have a score column (lower = cheaper)
-        if "score" not in screen_df.columns:
-            # If your screener doesn't provide a `score`, fall back to P/TB, then NCAV ratio.
-            candidates = []
-            if "p_tangible_book" in screen_df.columns:
-                candidates.append(screen_df["p_tangible_book"])
-            if "ncav_ratio" in screen_df.columns:
-                candidates.append(screen_df["ncav_ratio"])
-            if not candidates:
-                print("[DeepValueStrategy] Screener output missing score/p_tangible_book/ncav_ratio, skipping bar.")
-                return
-            tmp = pd.concat(candidates, axis=1).replace({0.0: np.nan})
-            screen_df["score"] = tmp.min(axis=1)
+        # Use symbol as index for quick lookup
+        screen_df[symbol_col] = screen_df[symbol_col].astype(str)
+        screen_df.set_index(symbol_col, inplace=True, drop=False)
 
-        # Drop rows with missing scores
-        sdf = screen_df.dropna(subset=["score"]).copy()
-        if sdf.empty:
-            return
-
-        sdf.sort_values("score", inplace=True)
-        top = sdf.head(self.max_positions)
-        target_symbols = list(top[symbol_col].astype(str).unique())
-        if not target_symbols:
-            return
-
-        target_set = set(target_symbols)
-        current_symbols = set(broker.positions.keys())
+        # For logging: counts AFTER price-universe restriction
+        raw_count = len(screen_df)
+        mos_count = int(screen_df.get("mos_pass", False).sum()) if "mos_pass" in screen_df.columns else 0
+        qual_count = int(screen_df.get("passes_all", False).sum()) if "passes_all" in screen_df.columns else 0
+        print(
+            f"[DeepValueStrategy] {ts.date()} | Raw: {raw_count} | "
+            f"MoS pass: {mos_count} | MoS+quality pass: {qual_count}"
+        )
 
         # ---------------------------
-        # 2) Compute current equity
+        # 2) Forced exits (value & quality exit rules)
+        # ---------------------------
+        current_symbols = set(map(str, broker.positions.keys()))
+        forced_sells = set()
+
+        max_ptb_exit = self.cfg.get("MAX_P_TANGIBLE_BOOK_EXIT")
+        min_ncav_exit = self.cfg.get("MIN_NCAV_RATIO_EXIT")
+        exit_on_missing = self.cfg.get("EXIT_ON_MISSING_FUNDAMENTALS", True)
+
+        for sym in list(current_symbols):
+            if sym not in screen_df.index:
+                # No fundamentals for this name at all
+                if exit_on_missing:
+                    forced_sells.add(sym)
+                continue
+
+            row = screen_df.loc[sym]
+            ptb = float(row.get("p_tangible_book", np.nan))
+            ncav_ratio = float(row.get("ncav_ratio", np.nan))
+            quality_pass = bool(row.get("quality_pass", False))
+
+            # Value exit condition
+            value_exit = False
+            if max_ptb_exit is not None and not np.isnan(ptb):
+                if ptb > float(max_ptb_exit):
+                    value_exit = True
+            if min_ncav_exit is not None and not np.isnan(ncav_ratio):
+                if ncav_ratio < float(min_ncav_exit):
+                    value_exit = True
+
+            # Quality deterioration -> immediate exit
+            quality_exit = not quality_pass
+
+            days_held = self._days_held(sym, ts)
+            min_hold_ok = (
+                days_held is None or days_held >= self.min_holding_days
+            )
+
+            if quality_exit or (value_exit and min_hold_ok):
+                forced_sells.add(sym)
+
+        # Execute forced sells
+        for sym in forced_sells:
+            qty = broker.get_position(sym)
+            if qty > 0:
+                print(
+                    f"[DeepValueStrategy] {ts.date()} FORCED SELL {sym}: "
+                    f"qty={qty}"
+                )
+                broker.sell(ts, sym, qty)
+            self.entry_dates.pop(sym, None)
+
+        # Refresh current holdings after forced sells
+        current_symbols = set(map(str, broker.positions.keys()))
+
+        # ---------------------------
+        # 3) New entries from Graham-filtered candidates
+        # ---------------------------
+        if "passes_all" in screen_df.columns:
+            candidates = screen_df[screen_df["passes_all"]].copy()
+        else:
+            candidates = screen_df.copy()
+
+        if "score" in candidates.columns:
+            candidates.sort_values("score", inplace=True)
+
+        # Exclude names we already hold
+        available_slots = max(0, self.max_positions - len(current_symbols))
+        new_buys: List[str] = []
+        if available_slots > 0 and not candidates.empty:
+            for sym in candidates.index:
+                if sym in current_symbols:
+                    continue
+                new_buys.append(sym)
+                if len(new_buys) >= available_slots:
+                    break
+
+        if new_buys:
+            print(
+                f"[DeepValueStrategy] {ts.date()} | New Graham entries: "
+                f"{', '.join(new_buys)}"
+            )
+
+        # Target holdings are current (after forced sells) plus new buys
+        target_symbols = list(sorted(current_symbols | set(new_buys)))
+        if not target_symbols:
+            # Nothing to hold; stay in cash
+            print(f"[DeepValueStrategy] {ts.date()} | No holdings; staying in cash.")
+            self._last_rebalance_idx = bar_idx
+            return
+
+        # ---------------------------
+        # 4) Rebalance holdings to equal weight
         # ---------------------------
         equity = self._compute_equity(broker, market)
         if equity <= 0:
+            print(f"[DeepValueStrategy] {ts.date()} | Non-positive equity, skipping rebalance.")
+            self._last_rebalance_idx = bar_idx
             return
 
-        target_pos_count = min(len(target_symbols), self.max_positions)
-        if target_pos_count <= 0:
-            return
-
+        target_pos_count = len(target_symbols)
         target_value_per_pos = equity / float(target_pos_count)
 
-        # ---------------------------
-        # 3) Exit names that dropped out
-        # ---------------------------
-        for sym in current_symbols - target_set:
-            qty = broker.get_position(sym)
-            if qty > 0:
-                broker.sell(ts, sym, qty)
-
-        # ---------------------------
-        # 4) Rebalance / enter target names
-        # ---------------------------
         for sym in target_symbols:
             price = market.get_price(sym)
             if price is None or not np.isfinite(price) or price <= 0:
@@ -203,18 +310,23 @@ class DeepValueStrategy(Strategy):
             current_value = current_qty * price
             delta_value = target_value_per_pos - current_value
 
-            # Convert desired dollar change to shares
             shares_to_trade = int(delta_value // price)
             if shares_to_trade > 0:
+                # New buy or top-up
                 broker.buy(ts, sym, shares_to_trade)
+                # Record entry date if this is a brand new position
+                if current_qty == 0 and shares_to_trade > 0:
+                    self.entry_dates[sym] = ts
             elif shares_to_trade < 0:
+                # Partial trim
                 broker.sell(ts, sym, -shares_to_trade)
 
         self._last_rebalance_idx = bar_idx
 
     def on_end(self, broker: Broker, market: Market) -> None:
         """
-        At the end of the backtest, optionally liquidate everything so we get realized P&L.
+        At the end of the backtest, optionally liquidate everything so we
+        get realized P&L.
         """
         if not self.liquidate_on_end:
             return
@@ -229,3 +341,4 @@ class DeepValueStrategy(Strategy):
             qty = pos.quantity
             if qty > 0:
                 broker.sell(ts, sym, qty)
+        self.entry_dates.clear()

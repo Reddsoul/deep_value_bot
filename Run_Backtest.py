@@ -7,6 +7,10 @@ Convenience runner for the deep value backtest.
 
 Edit the CONFIG dictionary below with your desired parameters, then simply
 hit "Run" in your IDE / editor. No command line flags needed.
+
+This version is tuned for a more Graham-style, low-turnover portfolio:
+- Rebalance every ~quarter by default.
+- Minimum holding period is explicit.
 """
 
 from typing import List, Dict
@@ -25,13 +29,17 @@ from paper_broker import Broker, Market, run_backtest
 # ----------------------------------------------------------------------
 CONFIG: Dict[str, object] = {
     # Backtest window
-    "start": "2023-01-01",
+    "start": "2018-01-01",
     "end": "2024-12-31",
 
     # Portfolio
-    "initial_cash": 1_000.00,
+    "initial_cash": 100_000.00,
     "max_positions": 20,
-    "rebalance_every_n_days": 5,  # 1 = daily, 5 = weekly-ish
+
+    # Rebalancing / holding period
+    # rebalance_every_n_days ~ 63 ≈ quarterly (252 trading days / 4)
+    "rebalance_every_n_days": 63,
+    "min_holding_days": 180,  # enforce minimum holding period
 
     # Data
     "lookback_days": 365,  # how far back to pull price history before `start`
@@ -40,6 +48,9 @@ CONFIG: Dict[str, object] = {
     "commission_per_share": 0.005,
     "min_commission": 0.50,
 }
+
+# DEV/EXPERIMENTAL: limit universe size for speed during development
+MAX_UNIVERSE = 50
 
 
 # ----------------------------------------------------------------------
@@ -204,6 +215,7 @@ def main(config: Dict[str, object]) -> None:
     initial_cash = float(config["initial_cash"])
     max_positions = int(config["max_positions"])
     rebalance_every_n_days = int(config["rebalance_every_n_days"])
+    min_holding_days = int(config["min_holding_days"])
     lookback_days = int(config["lookback_days"])
     commission_per_share = float(config["commission_per_share"])
     min_commission = float(config["min_commission"])
@@ -220,6 +232,7 @@ def main(config: Dict[str, object]) -> None:
     print(f"[Run_Backtest] Initial cash: {initial_cash:,.2f}")
     print(f"[Run_Backtest] Max positions: {max_positions}")
     print(f"[Run_Backtest] Rebalance every N days: {rebalance_every_n_days}")
+    print(f"[Run_Backtest] Min holding days: {min_holding_days}")
     print(f"[Run_Backtest] Commission: {commission_per_share} /share, min {min_commission}")
 
     # 1) Universe
@@ -227,9 +240,6 @@ def main(config: Dict[str, object]) -> None:
     universe = get_sp_universe()
     print(f"[Run_Backtest] Universe has {len(universe)} names before trimming.")
 
-    # DEV/EXPERIMENTAL: trim universe so backtests run fast and don't spam Yahoo.
-    # Bump this up later (e.g. 200, 500) once you're happy with behavior.
-    MAX_UNIVERSE = 5
     if len(universe) > MAX_UNIVERSE:
         print(f"[Run_Backtest] Trimming universe from {len(universe)} to {MAX_UNIVERSE} tickers for this run.")
         universe = universe[:MAX_UNIVERSE]
@@ -261,6 +271,7 @@ def main(config: Dict[str, object]) -> None:
         universe=universe,
         max_positions=max_positions,
         rebalance_every_n_days=rebalance_every_n_days,
+        min_holding_days=min_holding_days,
         liquidate_on_end=True,
     )
 
