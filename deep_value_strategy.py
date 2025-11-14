@@ -77,6 +77,22 @@ class DeepValueStrategy(Strategy):
             return self.calendar.index(pd.to_datetime(ts))
         except ValueError:
             return None
+    
+    def _is_rebalance_idx(self, bar_idx: int) -> bool:
+        """
+        Return True if this bar index should trigger a rebalance.
+
+        Rules
+        -----
+        - First bar (index 0) always rebalances.
+        - Otherwise, we require at least `rebalance_every_n_days` trading
+          days to have passed since the last rebalance index.
+        """
+        if bar_idx == 0:
+            return True
+        if self._last_rebalance_idx is None:
+            return True
+        return (bar_idx - self._last_rebalance_idx) >= self.rebalance_every_n_days
 
     def _compute_equity(self, broker: Broker, market: Market) -> float:
         """Compute total equity = cash + sum(position.quantity * price)."""
@@ -103,6 +119,9 @@ class DeepValueStrategy(Strategy):
         market: Market,
         calendar: List[pd.Timestamp],
     ) -> None:
+        """
+        Receive the full trading calendar at the start of the backtest.
+        """
         self.calendar = [pd.to_datetime(d) for d in calendar]
         self._last_rebalance_idx = None
         self.entry_dates.clear()
@@ -123,18 +142,17 @@ class DeepValueStrategy(Strategy):
         """
         Graham-style rebalance logic with explicit entry/exit rules and
         willingness to hold cash.
+
+        NOTE: Only runs on scheduled rebalance indices; on other days this
+        is a no-op and we just let the broker mark to market.
         """
         ts = pd.to_datetime(ts)
         bar_idx = self._idx_for_ts(ts)
         if bar_idx is None:
             return
 
-        # Only rebalance every Nth bar
-        if (
-            self.rebalance_every_n_days > 1
-            and self._last_rebalance_idx is not None
-            and bar_idx - self._last_rebalance_idx < self.rebalance_every_n_days
-        ):
+        # --- Quarterly (or N-day) scheduling guard ---
+        if not self._is_rebalance_idx(bar_idx):
             return
 
         # ---------------------------
@@ -209,7 +227,6 @@ class DeepValueStrategy(Strategy):
 
         for sym in list(current_symbols):
             if sym not in screen_df.index:
-                # No fundamentals for this name at all
                 if exit_on_missing:
                     forced_sells.add(sym)
                 continue
@@ -219,7 +236,6 @@ class DeepValueStrategy(Strategy):
             ncav_ratio = float(row.get("ncav_ratio", np.nan))
             quality_pass = bool(row.get("quality_pass", False))
 
-            # Value exit condition
             value_exit = False
             if max_ptb_exit is not None and not np.isnan(ptb):
                 if ptb > float(max_ptb_exit):
@@ -228,7 +244,6 @@ class DeepValueStrategy(Strategy):
                 if ncav_ratio < float(min_ncav_exit):
                     value_exit = True
 
-            # Quality deterioration -> immediate exit
             quality_exit = not quality_pass
 
             days_held = self._days_held(sym, ts)
@@ -264,7 +279,6 @@ class DeepValueStrategy(Strategy):
         if "score" in candidates.columns:
             candidates.sort_values("score", inplace=True)
 
-        # Exclude names we already hold
         available_slots = max(0, self.max_positions - len(current_symbols))
         new_buys: List[str] = []
         if available_slots > 0 and not candidates.empty:
@@ -281,10 +295,8 @@ class DeepValueStrategy(Strategy):
                 f"{', '.join(new_buys)}"
             )
 
-        # Target holdings are current (after forced sells) plus new buys
         target_symbols = list(sorted(current_symbols | set(new_buys)))
         if not target_symbols:
-            # Nothing to hold; stay in cash
             print(f"[DeepValueStrategy] {ts.date()} | No holdings; staying in cash.")
             self._last_rebalance_idx = bar_idx
             return
@@ -312,15 +324,13 @@ class DeepValueStrategy(Strategy):
 
             shares_to_trade = int(delta_value // price)
             if shares_to_trade > 0:
-                # New buy or top-up
                 broker.buy(ts, sym, shares_to_trade)
-                # Record entry date if this is a brand new position
                 if current_qty == 0 and shares_to_trade > 0:
                     self.entry_dates[sym] = ts
             elif shares_to_trade < 0:
-                # Partial trim
                 broker.sell(ts, sym, -shares_to_trade)
 
+        # Record this bar as the latest rebalance
         self._last_rebalance_idx = bar_idx
 
     def on_end(self, broker: Broker, market: Market) -> None:

@@ -33,12 +33,13 @@ get_sp_universe(force_refresh: bool = False) -> list[str]
 
 from __future__ import annotations
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Iterable  # add Iterable
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
+import time  # NEW
 from io import StringIO  # for pd.read_html on literal html strings
 
 # ----------------------------------------------------------------------
@@ -74,149 +75,259 @@ GRAHAM_CONFIG: Dict[str, object] = {
         "debt_to_equity_proxy",
         "trailingEps",
     ],
+
+    # --- Universe selection ---
+    # "sp_mid_small" -> S&P 400 + 600 mid/small caps (current behavior)
+    # "nasdaq"       -> current NASDAQ ticker list via yfinance
+    "UNIVERSE_SOURCE": "sp_mid_small",
 }
 
+_FUND_CACHE: Dict[str, Dict[str, object]] = {}
 
-_SP_UNIVERSE_CACHE: Optional[List[str]] = None
-
-# Small fallback universe is kept here but NOT used for the mid/small universe.
-FALLBACK_UNIVERSE: List[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
-
-
-def _fetch_sp_table(url: str) -> pd.DataFrame:
+def get_nasdaq_universe(max_tickers: Optional[int] = None) -> List[str]:
     """
-    Helper to fetch the FIRST Wikipedia table on `url` that has a 'Symbol' column.
+    Return a cleaned list of NASDAQ tickers suitable for yfinance.
 
-    Wikipedia pages like S&P 600 can contain multiple tables. We don't want
-    the first random table; we want the one that actually contains ticker
-    symbols. This scans all tables on the page and returns the first one
-    where a column named 'Symbol' is present.
+    - Uses nasdaqtrader.com nasdaqtraded.txt
+    - Drops:
+        * Test issues
+        * ETFs
+        * Likely mutual funds (name contains "FUND")
+        * Weird symbols that almost always break yfinance: contain ^, +, =, #
+    - Converts BRK.A -> BRK-A, BF.B -> BF-B style tickers for class shares.
+
+    Parameters
+    ----------
+    max_tickers : int or None
+        If not None, truncate the list to the first `max_tickers` symbols.
+        Useful for debugging.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DeepValueBot/1.0; +https://example.com/bot)"
-    }
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
+    url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
+    print("[Deep_Value_Bot] Loading NASDAQ universe from nasdaqtrader.com...")
 
-    tables = pd.read_html(StringIO(resp.text))
-    if not tables:
-        raise RuntimeError(f"No HTML tables found at {url}")
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to load NASDAQ tickers from nasdaqtrader.com: {e}")
 
-    for tbl in tables:
-        cols = [str(c).strip().lower() for c in tbl.columns]
-        if any(c == "symbol" for c in cols):
-            return tbl
+    text = resp.text
+    df = pd.read_csv(StringIO(text), sep="|")
 
-    raise RuntimeError(f"No table with 'Symbol' column found at {url}")
-
-
-def get_sp_universe(force_refresh: bool = False) -> List[str]:
-    """
-    Fetch S&P 400 + S&P 600 tickers from Wikipedia.
-
-    Returns
-    -------
-    List[str]
-        Sorted list of unique ticker symbols in Yahoo Finance format.
-
-    Behavior
-    --------
-    - Uses `_fetch_sp_table()` which scans ALL tables on the page and picks
-      the one with a 'Symbol' column.
-    - Does NOT fall back to FAANG/mega-cap names. If something goes wrong,
-      this function raises, because this strategy is specifically intended
-      to trade mid/small-cap deep value names.
-    """
-    global _SP_UNIVERSE_CACHE
-    if _SP_UNIVERSE_CACHE is not None and not force_refresh:
-        return _SP_UNIVERSE_CACHE
-
-    urls = [
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400"),
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "S&P 600"),
-    ]
-
-    tickers: List[str] = []
-
-    for url, label in urls:
-        try:
-            print(f"[Deep_Value_Bot] Fetching {label} from {url} ...")
-            df = _fetch_sp_table(url)
-            if "Symbol" not in df.columns:
-                raise RuntimeError(f"Table for {label} missing 'Symbol' column.")
-            symbols = df["Symbol"].astype(str).str.strip().tolist()
-            tickers.extend(symbols)
-        except Exception as e:
-            raise RuntimeError(
-                f"[Deep_Value_Bot] ERROR: Failed to load {label} constituents "
-                f"from Wikipedia.\nURL: {url}\nReason: {e}\n\n"
-                "Deep value strategy requires mid/small caps — no fallback will be used.\n"
-                "Fix your internet or verify Wikipedia is reachable, then retry."
-            )
-
-    tickers = sorted(set(tickers))
-
-    if not tickers:
+    if "NASDAQ Symbol" not in df.columns:
         raise RuntimeError(
-            "[Deep_Value_Bot] ERROR: Loaded 0 tickers from S&P 400/600.\n"
-            "You must fix Wikipedia access — deep value bot does NOT use "
-            "large-cap fallback tickers."
+            "[Deep_Value_Bot] Unexpected format from nasdaqtrader.com "
+            "(missing 'NASDAQ Symbol')."
         )
 
-    print(f"[Deep_Value_Bot] Loaded {len(tickers)} tickers from S&P 400 + 600.")
-    _SP_UNIVERSE_CACHE = tickers
+    # 1) Filter out test issues
+    if "Test Issue" in df.columns:
+        df = df[df["Test Issue"] == "N"]
+
+    # 2) Filter out ETFs
+    if "ETF" in df.columns:
+        df = df[df["ETF"].astype(str).str.upper() != "Y"]
+
+    # 3) Filter out likely mutual funds by name (heuristic)
+    if "Security Name" in df.columns:
+        name_series = df["Security Name"].astype(str)
+        fund_mask = name_series.str.contains("FUND", case=False, na=False)
+        df = df[~fund_mask]
+
+    # Drop the 'File Creation Time' row if present
+    sym_col = df["NASDAQ Symbol"].astype(str)
+    mask_valid = sym_col.str.upper() != "FILE CREATION TIME"
+    df = df[mask_valid]
+
+    raw = (
+        df["NASDAQ Symbol"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .tolist()
+    )
+
+    # Drop obviously problematic characters for yfinance
+    bad_chars = set("^+=#")
+    filtered = [t for t in raw if not any(ch in t for ch in bad_chars)]
+
+    # Convert class shares from BRK.A -> BRK-A, BF.B -> BF-B, etc.
+    cleaned: List[str] = []
+    for t in filtered:
+        if "." in t:
+            base, suffix = t.split(".", 1)
+            # Heuristic: short suffix means it's probably a class/series
+            if 1 <= len(suffix) <= 3:
+                cleaned.append(f"{base}-{suffix}")
+            else:
+                cleaned.append(t)
+        else:
+            cleaned.append(t)
+
+    tickers = sorted(set(cleaned))
+
+    if max_tickers is not None:
+        tickers = tickers[: int(max_tickers)]
+
+    if not tickers:
+        raise RuntimeError("[Deep_Value_Bot] NASDAQ universe is empty after filtering.")
+
+    print(f"[Deep_Value_Bot] Loaded {len(tickers)} NASDAQ tickers after cleaning.")
     return tickers
 
+def _chunked(iterable: Iterable[str], batch_size: int) -> Iterable[List[str]]:
+    """Yield successive chunks from iterable of up to batch_size elements."""
+    batch: List[str] = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
-def _download_fundamentals(tickers: List[str]) -> pd.DataFrame:
+
+def _safe_fetch_info(
+    symbol: str,
+    max_retries: int = 3,
+    base_sleep: float = 1.0,
+) -> Dict[str, object]:
+    """
+    Fetch yf.Ticker(symbol).info with retries + backoff.
+
+    Returns an (possibly empty) dict on failure.
+    """
+    if symbol in _FUND_CACHE:
+        return _FUND_CACHE[symbol]
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            info = yf.Ticker(symbol).info or {}
+            _FUND_CACHE[symbol] = info
+            return info
+        except Exception as e:
+            last_err = e
+            sleep_s = base_sleep * (2 ** attempt)
+            print(
+                f"[Deep_Value_Bot] yfinance info failed for {symbol} "
+                f"(attempt {attempt + 1}/{max_retries}): {e}. "
+                f"Sleeping {sleep_s:.1f}s..."
+            )
+            time.sleep(sleep_s)
+
+    print(
+        f"[Deep_Value_Bot] WARNING: giving up on fundamentals for {symbol} "
+        f"after {max_retries} attempts. Last error: {last_err}"
+    )
+    _FUND_CACHE[symbol] = {}
+    return {}
+
+def _download_fundamentals(
+    tickers: List[str],
+    max_tickers: int = 1500,  # safety cap per run
+) -> pd.DataFrame:
     """
     Download fundamental data for a list of tickers via yfinance.
 
-    Returns a DataFrame indexed by ticker, with columns like:
-    - marketCap
-    - totalAssets
-    - totalLiab
-    - netTangibleAssets
-    - cash
-    - totalDebt
-    - totalCurrentAssets
-    - totalCurrentLiabilities
-    - trailingEps
-    (plus any other fields we might pull in future)
+    To avoid hammering Yahoo, we cap the number of tickers per run.
     """
-    records: List[Dict] = []
-    for i, t in enumerate(tickers, start=1):
-        try:
-            print(f"[Deep_Value_Bot] [{i}/{len(tickers)}] Fetching fundamentals for {t}...")
-            yf_t = yf.Ticker(t)
-            info = yf_t.info or {}
-        except Exception as e:
-            print(f"[Deep_Value_Bot] Error fetching {t}: {e}")
-            continue
+    if not tickers:
+        raise ValueError("_download_fundamentals: empty ticker list")
 
-        rec: Dict[str, object] = {"ticker": t}
-        # Core balance-sheet / valuation fields
-        for key in [
-            "marketCap",
-            "totalAssets",
-            "totalLiab",
-            "netTangibleAssets",
-            "cash",
-            "totalDebt",
-            "totalCurrentAssets",
-            "totalCurrentLiabilities",
-            "trailingEps",
-        ]:
-            rec[key] = info.get(key, np.nan)
+    uniq_all = sorted({str(t).strip().upper() for t in tickers if t})
 
-        records.append(rec)
+    if len(uniq_all) > max_tickers:
+        print(
+            f"[Deep_Value_Bot] Fundamental universe {len(uniq_all)} > max_tickers={max_tickers}; "
+            f"truncating for this run."
+        )
+        uniq = uniq_all[:max_tickers]
+    else:
+        uniq = uniq_all
+
+    records: List[Dict[str, object]] = []
+
+    print(
+        f"[Deep_Value_Bot] Downloading fundamentals for "
+        f"{len(uniq)} tickers via yfinance (with caching & retries)..."
+    )
+
+    for batch in _chunked(uniq, batch_size=64):
+        for sym in batch:
+            info = _safe_fetch_info(sym)
+            if not info:
+                record = {
+                    "ticker": sym,
+                    "marketCap": np.nan,
+                    "totalAssets": np.nan,
+                    "totalLiab": np.nan,
+                    "netTangibleAssets": np.nan,
+                    "cash": np.nan,
+                    "totalDebt": np.nan,
+                    "totalCurrentAssets": np.nan,
+                    "totalCurrentLiabilities": np.nan,
+                    "trailingEps": np.nan,
+                }
+            else:
+                record = {
+                    "ticker": sym,
+                    "marketCap": info.get("marketCap", np.nan),
+                    "totalAssets": info.get("totalAssets", np.nan),
+                    "totalLiab": info.get("totalLiab", np.nan),
+                    "netTangibleAssets": info.get("netTangibleAssets", np.nan),
+                    "cash": info.get("cash", np.nan),
+                    "totalDebt": info.get("totalDebt", np.nan),
+                    "totalCurrentAssets": info.get("totalCurrentAssets", np.nan),
+                    "totalCurrentLiabilities": info.get(
+                        "totalCurrentLiabilities", np.nan
+                    ),
+                    "trailingEps": info.get("trailingEps", np.nan),
+                }
+            records.append(record)
+
+        # Gentle pause between batches to be nice to Yahoo
+        time.sleep(1.0)
 
     if not records:
         raise RuntimeError("No fundamental data could be fetched.")
 
     df = pd.DataFrame.from_records(records).set_index("ticker")
-    return df
 
+    # Ensure expected columns exist
+    for col in [
+        "marketCap",
+        "totalAssets",
+        "totalLiab",
+        "netTangibleAssets",
+        "cash",
+        "totalDebt",
+        "totalCurrentAssets",
+        "totalCurrentLiabilities",
+        "trailingEps",
+    ]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Derived metrics (you already compute some later, but these are safe)
+    mkt = df["marketCap"].astype(float)
+    total_assets = df["totalAssets"].astype(float)
+    total_liab = df["totalLiab"].astype(float)
+    net_tang = df["netTangibleAssets"].astype(float)
+    cash = df["cash"].astype(float)
+    total_debt = df["totalDebt"].astype(float)
+    ca = df["totalCurrentAssets"].astype(float)
+    cl = df["totalCurrentLiabilities"].astype(float)
+
+    df["p_tangible_book"] = np.where(net_tang > 0, mkt / net_tang, np.nan)
+    ncav_num = ca - total_liab
+    df["ncav_ratio"] = np.where(mkt > 0, ncav_num / mkt, np.nan)
+    equity_approx = total_assets - total_liab
+    df["debt_to_equity"] = np.where(equity_approx > 0, total_debt / equity_approx, np.nan)
+    df["current_ratio"] = np.where(cl > 0, ca / cl, np.nan)
+
+    return df
 
 def _compute_value_metrics(fund_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -274,7 +385,6 @@ def _compute_value_metrics(fund_df: pd.DataFrame) -> pd.DataFrame:
     df["score"] = score_mat.mean(axis=1)
 
     return df
-
 
 def _apply_graham_filters(
     df: pd.DataFrame,
@@ -338,7 +448,6 @@ def _apply_graham_filters(
 
     return df
 
-
 def run_screen(
     as_of_date,
     universe_override: Optional[List[str]] = None,
@@ -352,7 +461,7 @@ def run_screen(
     ----------
     as_of_date : pd.Timestamp | str
     universe_override : list[str] or None
-        If provided, use this universe instead of S&P 400/600.
+        If provided, use this universe instead of config-driven universe.
     mode : {"filtered", "raw"}
         "raw"      -> return all names with mos/quality flags.
         "filtered" -> only names where passes_all == True.
@@ -381,11 +490,20 @@ def run_screen(
     if config:
         cfg.update(config)
 
-    # Universe
+    # ---------------------------
+    # Universe selection
+    # ---------------------------
     if universe_override is not None:
         universe = list(universe_override)
     else:
-        universe = get_sp_universe()
+        universe_source = cfg.get("UNIVERSE_SOURCE")
+        if universe_source == "nasdaq":
+            universe = get_nasdaq_universe()
+        else:
+            raise ValueError(
+                f"Unsupported UNIVERSE_SOURCE={universe_source!r}. "
+                "Use 'sp_mid_small' or 'nasdaq'."
+            )
 
     if not universe:
         raise RuntimeError("Universe is empty; cannot run screen.")

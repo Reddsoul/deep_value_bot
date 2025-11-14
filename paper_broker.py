@@ -204,14 +204,13 @@ class Broker:
         """
         Compute current equity at timestamp `ts` and append to history.
         """
-        equity = float(self.cash)
         positions_value = 0.0
         for pos in self.positions.values():
             price = self.market.get_price(pos.symbol)
             if price is not None and np.isfinite(price):
                 positions_value += pos.quantity * price
 
-        equity += positions_value
+        equity = float(self.cash) + positions_value
         self.equity_history.append(
             {
                 "timestamp": pd.to_datetime(ts),

@@ -13,15 +13,18 @@ This version is tuned for a more Graham-style, low-turnover portfolio:
 - Minimum holding period is explicit.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Iterable, Tuple, Optional  # extended
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from Deep_Value_Bot import get_sp_universe
+from Deep_Value_Bot import get_nasdaq_universe
 from deep_value_strategy import DeepValueStrategy
 from paper_broker import Broker, Market, run_backtest
+
+from datetime import date
+import time  # NEW
 
 
 # ----------------------------------------------------------------------
@@ -29,11 +32,11 @@ from paper_broker import Broker, Market, run_backtest
 # ----------------------------------------------------------------------
 CONFIG: Dict[str, object] = {
     # Backtest window
-    "start": "2018-01-01",
-    "end": "2024-12-31",
+    "start": "2024-01-01",
+    "end": date.today().strftime("%Y-%m-%d"),
 
     # Portfolio
-    "initial_cash": 100_000.00,
+    "initial_cash": 1000.00,
     "max_positions": 20,
 
     # Rebalancing / holding period
@@ -50,71 +53,137 @@ CONFIG: Dict[str, object] = {
 }
 
 # DEV/EXPERIMENTAL: limit universe size for speed during development
-MAX_UNIVERSE = 50
-
+MAX_UNIVERSE = 50000
 
 # ----------------------------------------------------------------------
 # Data utilities
 # ----------------------------------------------------------------------
+# In-process price cache: (symbols tuple, start, end) -> DataFrame
+_PRICE_CACHE: Dict[Tuple[Tuple[str, ...], str, str], pd.DataFrame] = {}
+
+def _chunked(iterable: Iterable[str], batch_size: int) -> Iterable[List[str]]:
+    batch: List[str] = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
 def get_universe_prices(
     symbols: List[str],
     start: str,
     end: str,
+    batch_size: int = 32,        # smaller batch size
+    max_retries: int = 5,        # a bit more patient
+    base_sleep: float = 2.0,
 ) -> pd.DataFrame:
     """
-    Download daily price data for `symbols` between `start` and `end`.
+    Download daily price data for `symbols` between `start` and `end`
+    with batching, retry logic, and an in-process cache.
 
-    Parameters
-    ----------
-    symbols : list[str]
-        List of tickers (Yahoo format).
-    start : str
-        Start date (YYYY-MM-DD).
-    end : str
-        End date (YYYY-MM-DD).
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame of adjusted close prices, index=dates, columns=symbols.
+    More defensive against yfinance rate limiting.
     """
     if not symbols:
         raise ValueError("No symbols provided for price download.")
 
-    print(f"[Run_Backtest] Downloading prices for {len(symbols)} symbols from {start} to {end}...")
-    data = yf.download(
-        tickers=list(symbols),
-        start=start,
-        end=end,
-        auto_adjust=True,
-        progress=False,
+    uniq = sorted({str(s).strip().upper() for s in symbols if s})
+    cache_key = (tuple(uniq), str(start), str(end))
+    if cache_key in _PRICE_CACHE:
+        print("[Run_Backtest] Using cached price DataFrame.")
+        return _PRICE_CACHE[cache_key].copy()
+
+    print(
+        f"[Run_Backtest] Downloading prices for {len(uniq)} symbols "
+        f"from {start} to {end} in batches of {batch_size}..."
     )
 
-    if isinstance(data, pd.DataFrame) and "Adj Close" in data.columns:
-        # Single-ticker case (columns: Open, High, Low, Close, Adj Close, Volume)
-        price_df = data[["Adj Close"]].rename(columns={"Adj Close": symbols[0]})
-    elif isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
-        # Multi-ticker: data["Adj Close"] is a DataFrame with columns = symbols
-        if "Adj Close" in data.columns.get_level_values(0):
-            price_df = data["Adj Close"].copy()
-        elif "Close" in data.columns.get_level_values(0):
-            price_df = data["Close"].copy()
-        else:
-            raise RuntimeError("Unexpected columns from yfinance (no Close/Adj Close).")
-    else:
-        # Fallback: maybe we only got a single-column "Close"
-        if "Adj Close" in data.columns:
-            price_df = data[["Adj Close"]].rename(columns={"Adj Close": symbols[0]})
-        elif "Close" in data.columns:
-            price_df = data[["Close"]].rename(columns={"Close": symbols[0]})
-        else:
-            raise RuntimeError("Unexpected columns from yfinance (no Close/Adj Close).")
+    all_frames: List[pd.DataFrame] = []
 
-    price_df.index = pd.to_datetime(price_df.index)
-    price_df = price_df.sort_index()
-    print(f"[Run_Backtest] Downloaded {price_df.shape[0]} rows of prices.")
-    return price_df
+    for batch in _chunked(uniq, batch_size=batch_size):
+        last_err: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(
+                    tickers=batch,
+                    start=start,
+                    end=end,
+                    auto_adjust=True,
+                    progress=False,
+                    group_by="column",
+                    threads=True,
+                )
 
+                if df.empty:
+                    raise RuntimeError("Empty DataFrame returned from yfinance.")
+
+                # Single-symbol case
+                if len(batch) == 1 and not isinstance(df.columns, pd.MultiIndex):
+                    sym = batch[0]
+                    if "Adj Close" in df.columns:
+                        adj = df["Adj Close"].rename(sym).to_frame()
+                    elif "Close" in df.columns:
+                        adj = df["Close"].rename(sym).to_frame()
+                    else:
+                        raise RuntimeError("Unexpected columns for single-symbol download")
+
+                else:
+                    # Multi-symbol case
+                    if isinstance(df.columns, pd.MultiIndex):
+                        lvl0 = df.columns.get_level_values(0)
+                        if "Adj Close" in lvl0:
+                            adj = df["Adj Close"]
+                        elif "Close" in lvl0:
+                            adj = df["Close"]
+                        else:
+                            raise RuntimeError("Unexpected MultiIndex columns from yfinance.")
+                    else:
+                        adj = df
+
+                all_frames.append(adj)
+                break  # success
+
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                # Heavier backoff if clearly rate-limited
+                if "Rate limited" in msg or "Too Many Requests" in msg:
+                    sleep_s = base_sleep * (2 ** attempt) * 3.0
+                else:
+                    sleep_s = base_sleep * (2 ** attempt)
+
+                print(
+                    f"[Run_Backtest] Price download failed for batch "
+                    f"{batch[0]}..{batch[-1]} (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Sleeping {sleep_s:.1f}s..."
+                )
+                time.sleep(sleep_s)
+        else:
+            print(
+                f"[Run_Backtest] WARNING: giving up on batch "
+                f"{batch[0]}..{batch[-1]} after {max_retries} attempts. "
+                f"Last error: {last_err}"
+            )
+
+        # Gentle pause between batches
+        time.sleep(1.0)
+
+    if not all_frames:
+        raise RuntimeError("[Run_Backtest] No price data downloaded at all.")
+
+    prices = pd.concat(all_frames, axis=1)
+    prices = prices.loc[:, ~prices.columns.duplicated()]
+
+    cols = [s for s in uniq if s in prices.columns]
+    prices = prices[cols]
+
+    prices.index = pd.to_datetime(prices.index)
+    prices.sort_index(inplace=True)
+
+    print(f"[Run_Backtest] Downloaded {prices.shape[0]} rows of prices for {len(cols)} symbols.")
+    _PRICE_CACHE[cache_key] = prices.copy()
+    return prices
 
 # ----------------------------------------------------------------------
 # Analytics
@@ -235,10 +304,10 @@ def main(config: Dict[str, object]) -> None:
     print(f"[Run_Backtest] Min holding days: {min_holding_days}")
     print(f"[Run_Backtest] Commission: {commission_per_share} /share, min {min_commission}")
 
-    # 1) Universe
-    print("[Run_Backtest] Building universe from Deep_Value_Bot.get_sp_universe()...")
-    universe = get_sp_universe()
-    print(f"[Run_Backtest] Universe has {len(universe)} names before trimming.")
+    # 1) Universe (NASDAQ)
+    print("[Run_Backtest] Building universe from Deep_Value_Bot.get_nasdaq_universe()...")
+    universe = get_nasdaq_universe()
+    print(f"[Run_Backtest] NASDAQ universe has {len(universe)} names before trimming.")
 
     if len(universe) > MAX_UNIVERSE:
         print(f"[Run_Backtest] Trimming universe from {len(universe)} to {MAX_UNIVERSE} tickers for this run.")
@@ -252,11 +321,7 @@ def main(config: Dict[str, object]) -> None:
     )
 
     # 3) Build trading calendar (intersection of requested dates and available prices)
-    calendar = [
-        d
-        for d in prices.index
-        if start_dt <= d <= end_dt
-    ]
+    calendar = [d for d in prices.index if start_dt <= d <= end_dt]
     print(f"[Run_Backtest] Trading calendar has {len(calendar)} bars in requested period.")
 
     # 4) Instantiate Market, Broker, Strategy
