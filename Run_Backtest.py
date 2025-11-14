@@ -36,7 +36,7 @@ CONFIG: Dict[str, object] = {
     "end": date.today().strftime("%Y-%m-%d"),
 
     # Portfolio
-    "initial_cash": 1000.00,
+    "initial_cash": 5000.00,
     "max_positions": 20,
 
     # Rebalancing / holding period
@@ -59,6 +59,42 @@ MAX_UNIVERSE = 50000
 # Data utilities
 # ----------------------------------------------------------------------
 # In-process price cache: (symbols tuple, start, end) -> DataFrame
+# Symbols that repeatedly fail to download prices get quarantined here.
+_QUARANTINED_SYMBOLS: set[str] = set()
+
+
+def filter_universe_by_price_history(
+    universe: List[str],
+    prices: pd.DataFrame,
+    min_history_days: int = 180,
+) -> List[str]:
+    """
+    Filter a symbol universe to those with at least `min_history_days`
+    of non-NaN prices in the provided price DataFrame.
+    """
+    if prices.empty:
+        print("[Run_Backtest] WARNING: prices DataFrame is empty in filter_universe_by_price_history.")
+        return []
+
+    universe = [str(s).strip().upper() for s in universe if s]
+    filtered: List[str] = []
+
+    for sym in universe:
+        if sym not in prices.columns:
+            continue
+        s = prices[sym].dropna()
+        if s.empty:
+            continue
+        span_days = (s.index.max() - s.index.min()).days
+        if span_days >= min_history_days:
+            filtered.append(sym)
+
+    print(
+        f"[Run_Backtest] Price-history filter: {len(universe)} -> {len(filtered)} "
+        f"symbols with >= {min_history_days} days of data."
+    )
+    return filtered
+
 _PRICE_CACHE: Dict[Tuple[Tuple[str, ...], str, str], pd.DataFrame] = {}
 
 def _chunked(iterable: Iterable[str], batch_size: int) -> Iterable[List[str]]:
@@ -75,15 +111,16 @@ def get_universe_prices(
     symbols: List[str],
     start: str,
     end: str,
-    batch_size: int = 32,        # smaller batch size
-    max_retries: int = 5,        # a bit more patient
+    batch_size: int = 32,
+    max_retries: int = 5,
     base_sleep: float = 2.0,
 ) -> pd.DataFrame:
     """
     Download daily price data for `symbols` between `start` and `end`
-    with batching, retry logic, and an in-process cache.
+    with batching, retry logic, and an in-process cache plus per-symbol
+    quarantine.
 
-    More defensive against yfinance rate limiting.
+    More defensive against yfinance rate limiting and symbol-specific failures.
     """
     if not symbols:
         raise ValueError("No symbols provided for price download.")
@@ -100,13 +137,21 @@ def get_universe_prices(
     )
 
     all_frames: List[pd.DataFrame] = []
+    quarantined_local: set[str] = set()
 
-    for batch in _chunked(uniq, batch_size=batch_size):
+    def _download_batch(batch_syms: List[str]) -> pd.DataFrame:
+        """
+        Helper that tries a batch, then halves, then single-symbol fallback.
+        Returns a DataFrame (possibly empty) of Adj Close / Close.
+        """
+        nonlocal quarantined_local
+
+        # First try full batch with retries
         last_err: Optional[Exception] = None
         for attempt in range(max_retries):
             try:
                 df = yf.download(
-                    tickers=batch,
+                    tickers=batch_syms,
                     start=start,
                     end=end,
                     auto_adjust=True,
@@ -114,22 +159,19 @@ def get_universe_prices(
                     group_by="column",
                     threads=True,
                 )
-
                 if df.empty:
                     raise RuntimeError("Empty DataFrame returned from yfinance.")
 
                 # Single-symbol case
-                if len(batch) == 1 and not isinstance(df.columns, pd.MultiIndex):
-                    sym = batch[0]
+                if len(batch_syms) == 1 and not isinstance(df.columns, pd.MultiIndex):
+                    sym = batch_syms[0]
                     if "Adj Close" in df.columns:
                         adj = df["Adj Close"].rename(sym).to_frame()
                     elif "Close" in df.columns:
                         adj = df["Close"].rename(sym).to_frame()
                     else:
                         raise RuntimeError("Unexpected columns for single-symbol download")
-
                 else:
-                    # Multi-symbol case
                     if isinstance(df.columns, pd.MultiIndex):
                         lvl0 = df.columns.get_level_values(0)
                         if "Adj Close" in lvl0:
@@ -141,13 +183,11 @@ def get_universe_prices(
                     else:
                         adj = df
 
-                all_frames.append(adj)
-                break  # success
+                return adj
 
             except Exception as e:
                 last_err = e
                 msg = str(e)
-                # Heavier backoff if clearly rate-limited
                 if "Rate limited" in msg or "Too Many Requests" in msg:
                     sleep_s = base_sleep * (2 ** attempt) * 3.0
                 else:
@@ -155,22 +195,52 @@ def get_universe_prices(
 
                 print(
                     f"[Run_Backtest] Price download failed for batch "
-                    f"{batch[0]}..{batch[-1]} (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"{batch_syms[0]}..{batch_syms[-1]} (attempt {attempt + 1}/{max_retries}): {e}. "
                     f"Sleeping {sleep_s:.1f}s..."
                 )
                 time.sleep(sleep_s)
+
+        print(
+            f"[Run_Backtest] WARNING: giving up on batch "
+            f"{batch_syms[0]}..{batch_syms[-1]} after {max_retries} attempts. "
+            f"Last error: {last_err}"
+        )
+
+        # If batch failed entirely and has more than 1 symbol, try smaller chunks
+        if len(batch_syms) > 1:
+            mid = len(batch_syms) // 2
+            left = _download_batch(batch_syms[:mid])
+            right = _download_batch(batch_syms[mid:])
+            # Combine partial results
+            if not left.empty or not right.empty:
+                return pd.concat([left, right], axis=1)
         else:
-            print(
-                f"[Run_Backtest] WARNING: giving up on batch "
-                f"{batch[0]}..{batch[-1]} after {max_retries} attempts. "
-                f"Last error: {last_err}"
-            )
+            # Single-symbol repeated failure: quarantine it
+            sym = batch_syms[0]
+            print(f"[Run_Backtest] Quarantining symbol with persistent price failures: {sym}")
+            quarantined_local.add(sym)
+
+        return pd.DataFrame()
+
+    # Main loop over top-level batches
+    for batch in _chunked(uniq, batch_size=batch_size):
+        batch = [s for s in batch if s not in _QUARANTINED_SYMBOLS]
+        if not batch:
+            continue
+
+        adj = _download_batch(batch)
+        if not adj.empty:
+            all_frames.append(adj)
 
         # Gentle pause between batches
         time.sleep(1.0)
 
+    if quarantined_local:
+        _QUARANTINED_SYMBOLS.update(quarantined_local)
+        print(f"[Run_Backtest] Total newly quarantined symbols: {len(quarantined_local)}")
+
     if not all_frames:
-        raise RuntimeError("[Run_Backtest] No price data downloaded at all.")
+        raise RuntimeError("[Run_Backtest] No price data downloaded at all (all batches failed).")
 
     prices = pd.concat(all_frames, axis=1)
     prices = prices.loc[:, ~prices.columns.duplicated()]
@@ -181,7 +251,10 @@ def get_universe_prices(
     prices.index = pd.to_datetime(prices.index)
     prices.sort_index(inplace=True)
 
-    print(f"[Run_Backtest] Downloaded {prices.shape[0]} rows of prices for {len(cols)} symbols.")
+    print(
+        f"[Run_Backtest] Downloaded {prices.shape[0]} rows of prices for "
+        f"{len(cols)} symbols (after dropping failures & duplicates)."
+    )
     _PRICE_CACHE[cache_key] = prices.copy()
     return prices
 
@@ -310,7 +383,10 @@ def main(config: Dict[str, object]) -> None:
     print(f"[Run_Backtest] NASDAQ universe has {len(universe)} names before trimming.")
 
     if len(universe) > MAX_UNIVERSE:
-        print(f"[Run_Backtest] Trimming universe from {len(universe)} to {MAX_UNIVERSE} tickers for this run.")
+        print(
+            f"[Run_Backtest] Trimming universe from {len(universe)} to "
+            f"{MAX_UNIVERSE} tickers for this run (dev safety cap)."
+        )
         universe = universe[:MAX_UNIVERSE]
 
     # 2) Price history for the whole universe
@@ -319,6 +395,18 @@ def main(config: Dict[str, object]) -> None:
         start=lookback_start_dt.strftime("%Y-%m-%d"),
         end=(end_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
     )
+
+    # 2b) Price-based universe cleaning (must occur before fundamentals)
+    universe_clean = filter_universe_by_price_history(
+        universe=universe,
+        prices=prices,
+        min_history_days=180,
+    )
+    if not universe_clean:
+        raise RuntimeError("[Run_Backtest] No symbols with sufficient price history; aborting.")
+
+    universe = universe_clean
+    print(f"[Run_Backtest] Final trading universe size after price cleaning: {len(universe)}")
 
     # 3) Build trading calendar (intersection of requested dates and available prices)
     calendar = [d for d in prices.index if start_dt <= d <= end_dt]

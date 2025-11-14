@@ -83,24 +83,18 @@ GRAHAM_CONFIG: Dict[str, object] = {
 }
 
 _FUND_CACHE: Dict[str, Dict[str, object]] = {}
+FUNDAMENTAL_QUARANTINE: set[str] = set()  # NEW
+
 
 def get_nasdaq_universe(max_tickers: Optional[int] = None) -> List[str]:
     """
-    Return a cleaned list of NASDAQ tickers suitable for yfinance.
+    Return a deeply cleaned list of NASDAQ tickers suitable for yfinance.
 
-    - Uses nasdaqtrader.com nasdaqtraded.txt
-    - Drops:
-        * Test issues
-        * ETFs
-        * Likely mutual funds (name contains "FUND")
-        * Weird symbols that almost always break yfinance: contain ^, +, =, #
-    - Converts BRK.A -> BRK-A, BF.B -> BF-B style tickers for class shares.
-
-    Parameters
-    ----------
-    max_tickers : int or None
-        If not None, truncate the list to the first `max_tickers` symbols.
-        Useful for debugging.
+    Cleaning stages:
+      1) Drop test issues, ETFs.
+      2) Drop funds (name contains 'FUND').
+      3) Drop preferreds, warrants, rights, units, structured notes, SPAC-like names.
+      4) Drop obviously broken symbols (^, +, =, #, /).
     """
     url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
     print("[Deep_Value_Bot] Loading NASDAQ universe from nasdaqtrader.com...")
@@ -120,24 +114,63 @@ def get_nasdaq_universe(max_tickers: Optional[int] = None) -> List[str]:
             "(missing 'NASDAQ Symbol')."
         )
 
+    total_raw = len(df)
+    print(f"[Deep_Value_Bot] Raw NASDAQ rows: {total_raw}")
+
     # 1) Filter out test issues
     if "Test Issue" in df.columns:
+        before = len(df)
         df = df[df["Test Issue"] == "N"]
+        print(f"[Deep_Value_Bot] Removed {before - len(df)} test issues.")
 
     # 2) Filter out ETFs
     if "ETF" in df.columns:
+        before = len(df)
         df = df[df["ETF"].astype(str).str.upper() != "Y"]
+        print(f"[Deep_Value_Bot] Removed {before - len(df)} ETFs.")
 
-    # 3) Filter out likely mutual funds by name (heuristic)
+    # 3) Filter out likely mutual funds by name
     if "Security Name" in df.columns:
         name_series = df["Security Name"].astype(str)
+        before = len(df)
         fund_mask = name_series.str.contains("FUND", case=False, na=False)
         df = df[~fund_mask]
+        print(f"[Deep_Value_Bot] Removed {before - len(df)} funds (name contains 'FUND').")
 
     # Drop the 'File Creation Time' row if present
     sym_col = df["NASDAQ Symbol"].astype(str)
     mask_valid = sym_col.str.upper() != "FILE CREATION TIME"
     df = df[mask_valid]
+
+    # 4) Remove preferreds, warrants, rights, units, SPAC-like names, structured notes
+    if "Security Name" in df.columns:
+        name_series = df["Security Name"].astype(str).str.upper()
+    else:
+        name_series = pd.Series("", index=df.index)
+
+    sym_series = df["NASDAQ Symbol"].astype(str).str.upper()
+
+    # Preferreds: look at name tokens
+    pref_mask = name_series.str.contains("PREFERRED", na=False) | name_series.str.contains("PFD", na=False)
+    # Warrants
+    warrant_mask = name_series.str.contains("WARRANT", na=False) | sym_series.str.endswith(("W", "WS", "WT"))
+    # Rights
+    rights_mask = name_series.str.contains("RIGHT", na=False) | sym_series.str.endswith("R")
+    # Units
+    units_mask = name_series.str.contains("UNIT", na=False) | sym_series.str.endswith("U")
+    # Structured notes / weird instruments
+    struct_mask = sym_series.str.contains("/", na=False)
+    # SPAC-like (very heuristic)
+    spac_mask = (
+        name_series.str.contains("ACQUISITION", na=False)
+        | name_series.str.contains("HOLDINGS", na=False)
+        | name_series.str.contains("CAPITAL", na=False)
+    )
+
+    junk_mask = pref_mask | warrant_mask | rights_mask | units_mask | struct_mask | spac_mask
+    before = len(df)
+    df = df[~junk_mask]
+    print(f"[Deep_Value_Bot] Removed {before - len(df)} preferreds/warrants/rights/units/SPAC-like/notes.")
 
     raw = (
         df["NASDAQ Symbol"]
@@ -149,7 +182,7 @@ def get_nasdaq_universe(max_tickers: Optional[int] = None) -> List[str]:
     )
 
     # Drop obviously problematic characters for yfinance
-    bad_chars = set("^+=#")
+    bad_chars = set("^+=#/")  # also drop '/' here as a last resort
     filtered = [t for t in raw if not any(ch in t for ch in bad_chars)]
 
     # Convert class shares from BRK.A -> BRK-A, BF.B -> BF-B, etc.
@@ -157,7 +190,6 @@ def get_nasdaq_universe(max_tickers: Optional[int] = None) -> List[str]:
     for t in filtered:
         if "." in t:
             base, suffix = t.split(".", 1)
-            # Heuristic: short suffix means it's probably a class/series
             if 1 <= len(suffix) <= 3:
                 cleaned.append(f"{base}-{suffix}")
             else:
@@ -171,9 +203,9 @@ def get_nasdaq_universe(max_tickers: Optional[int] = None) -> List[str]:
         tickers = tickers[: int(max_tickers)]
 
     if not tickers:
-        raise RuntimeError("[Deep_Value_Bot] NASDAQ universe is empty after filtering.")
+        raise RuntimeError("[Deep_Value_Bot] NASDAQ universe is empty after cleaning.")
 
-    print(f"[Deep_Value_Bot] Loaded {len(tickers)} NASDAQ tickers after cleaning.")
+    print(f"[Deep_Value_Bot] Final cleaned NASDAQ universe: {len(tickers)} tickers.")
     return tickers
 
 def _chunked(iterable: Iterable[str], batch_size: int) -> Iterable[List[str]]:
@@ -187,24 +219,42 @@ def _chunked(iterable: Iterable[str], batch_size: int) -> Iterable[List[str]]:
     if batch:
         yield batch
 
-
 def _safe_fetch_info(
     symbol: str,
-    max_retries: int = 3,
+    max_retries: int = 5,
     base_sleep: float = 1.0,
 ) -> Dict[str, object]:
     """
-    Fetch yf.Ticker(symbol).info with retries + backoff.
+    Fetch yf.Ticker(symbol).info with retries + backoff + fallbacks.
 
-    Returns an (possibly empty) dict on failure.
+    - First try .info
+    - On failure, fall back to .fast_info for marketCap.
+    - On persistent failure, return a minimal dict and add to FUNDAMENTAL_QUARANTINE.
     """
+    symbol = str(symbol).upper()
+
     if symbol in _FUND_CACHE:
         return _FUND_CACHE[symbol]
+
+    if symbol in FUNDAMENTAL_QUARANTINE:
+        return _FUND_CACHE.get(symbol, {})
 
     last_err: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
-            info = yf.Ticker(symbol).info or {}
+            t = yf.Ticker(symbol)
+            info = t.info or {}
+            if not info:
+                # Try fast_info as a fallback source of marketCap
+                try:
+                    fi = getattr(t, "fast_info", None)
+                    if fi is not None:
+                        mcap = getattr(fi, "market_cap", None) or getattr(fi, "marketCap", None)
+                        if mcap is not None:
+                            info["marketCap"] = mcap
+                except Exception:
+                    pass
+
             _FUND_CACHE[symbol] = info
             return info
         except Exception as e:
@@ -221,24 +271,26 @@ def _safe_fetch_info(
         f"[Deep_Value_Bot] WARNING: giving up on fundamentals for {symbol} "
         f"after {max_retries} attempts. Last error: {last_err}"
     )
+    FUNDAMENTAL_QUARANTINE.add(symbol)
     _FUND_CACHE[symbol] = {}
     return {}
 
 def _download_fundamentals(
     tickers: List[str],
-    max_tickers: int = 1500,  # safety cap per run
+    max_tickers: Optional[int] = None,  # None = use full list
 ) -> pd.DataFrame:
     """
     Download fundamental data for a list of tickers via yfinance.
 
-    To avoid hammering Yahoo, we cap the number of tickers per run.
+    To avoid hammering Yahoo, you *may* pass max_tickers to temporarily cap
+    the number of tickers per run (for dev). In production, leave as None.
     """
     if not tickers:
         raise ValueError("_download_fundamentals: empty ticker list")
 
     uniq_all = sorted({str(t).strip().upper() for t in tickers if t})
 
-    if len(uniq_all) > max_tickers:
+    if max_tickers is not None and len(uniq_all) > max_tickers:
         print(
             f"[Deep_Value_Bot] Fundamental universe {len(uniq_all)} > max_tickers={max_tickers}; "
             f"truncating for this run."
@@ -251,40 +303,28 @@ def _download_fundamentals(
 
     print(
         f"[Deep_Value_Bot] Downloading fundamentals for "
-        f"{len(uniq)} tickers via yfinance (with caching & retries)..."
+        f"{len(uniq)} tickers via yfinance (with caching, retries & fallbacks)..."
     )
 
     for batch in _chunked(uniq, batch_size=64):
         for sym in batch:
             info = _safe_fetch_info(sym)
-            if not info:
-                record = {
-                    "ticker": sym,
-                    "marketCap": np.nan,
-                    "totalAssets": np.nan,
-                    "totalLiab": np.nan,
-                    "netTangibleAssets": np.nan,
-                    "cash": np.nan,
-                    "totalDebt": np.nan,
-                    "totalCurrentAssets": np.nan,
-                    "totalCurrentLiabilities": np.nan,
-                    "trailingEps": np.nan,
-                }
-            else:
-                record = {
-                    "ticker": sym,
-                    "marketCap": info.get("marketCap", np.nan),
-                    "totalAssets": info.get("totalAssets", np.nan),
-                    "totalLiab": info.get("totalLiab", np.nan),
-                    "netTangibleAssets": info.get("netTangibleAssets", np.nan),
-                    "cash": info.get("cash", np.nan),
-                    "totalDebt": info.get("totalDebt", np.nan),
-                    "totalCurrentAssets": info.get("totalCurrentAssets", np.nan),
-                    "totalCurrentLiabilities": info.get(
-                        "totalCurrentLiabilities", np.nan
-                    ),
-                    "trailingEps": info.get("trailingEps", np.nan),
-                }
+            # Minimal robust defaults
+            mcap = info.get("marketCap", np.nan)
+            record = {
+                "ticker": sym,
+                "marketCap": mcap,
+                "totalAssets": info.get("totalAssets", np.nan),
+                "totalLiab": info.get("totalLiab", np.nan),
+                "netTangibleAssets": info.get("netTangibleAssets", np.nan),
+                "cash": info.get("cash", np.nan),
+                "totalDebt": info.get("totalDebt", np.nan),
+                "totalCurrentAssets": info.get("totalCurrentAssets", np.nan),
+                "totalCurrentLiabilities": info.get(
+                    "totalCurrentLiabilities", np.nan
+                ),
+                "trailingEps": info.get("trailingEps", np.nan),
+            }
             records.append(record)
 
         # Gentle pause between batches to be nice to Yahoo
@@ -310,7 +350,12 @@ def _download_fundamentals(
         if col not in df.columns:
             df[col] = np.nan
 
-    # Derived metrics (you already compute some later, but these are safe)
+    # Drop obviously invalid rows (no marketCap at all)
+    before = len(df)
+    df = df[df["marketCap"].notna() & (df["marketCap"] > 0)]
+    print(f"[Deep_Value_Bot] Dropped {before - len(df)} names with invalid marketCap.")
+
+    # Derived metrics (keep in sync with _compute_value_metrics)
     mkt = df["marketCap"].astype(float)
     total_assets = df["totalAssets"].astype(float)
     total_liab = df["totalLiab"].astype(float)
@@ -448,6 +493,100 @@ def _apply_graham_filters(
 
     return df
 
+def _apply_graham_filters_with_relaxation(
+    df: pd.DataFrame,
+    cfg: Dict[str, object],
+    as_of_date: pd.Timestamp,
+    min_frac: float = 0.001,
+    min_abs: int = 3,
+) -> pd.DataFrame:
+    """
+    Apply Graham filters with adaptive relaxation so we never end up with
+    zero (or near-zero) candidates silently.
+
+    Steps:
+      0) Strict filters (current cfg).
+      1) Allow missing metrics, drop positive EPS requirement.
+      2) Relax MoS thresholds slightly.
+      3) If still too few, fall back to MoS-only and then best-score selection.
+    """
+    base = _apply_graham_filters(df, cfg)
+    universe_size = len(base)
+    if universe_size == 0:
+        print("[Deep_Value_Bot] Graham filter: empty universe; returning empty DataFrame.")
+        return base
+
+    threshold = max(min_abs, int(np.ceil(min_frac * universe_size)))
+    strict_pass = int(base["passes_all"].sum())
+    print(
+        f"[Deep_Value_Bot] {as_of_date.date()} | Strict Graham passes_all = "
+        f"{strict_pass} / {universe_size} (min target {threshold})."
+    )
+
+    if strict_pass >= threshold:
+        return base
+
+    # Step 1: Allow missing metrics + drop positive EPS requirement
+    cfg1 = dict(cfg)
+    cfg1["ALLOW_MISSING_METRICS"] = True
+    cfg1["REQUIRE_POSITIVE_EARNINGS_ENTRY"] = False
+    relaxed1 = _apply_graham_filters(df, cfg1)
+    pass1 = int(relaxed1["passes_all"].sum())
+    print(
+        f"[Deep_Value_Bot] Relaxation step 1 (allow missing, no EPS requirement): "
+        f"{pass1} / {universe_size}."
+    )
+    if pass1 >= threshold:
+        return relaxed1
+
+    # Step 2: Relax MoS thresholds slightly
+    cfg2 = dict(cfg1)
+    if cfg2.get("MAX_P_TANGIBLE_BOOK_ENTRY") is not None:
+        cfg2["MAX_P_TANGIBLE_BOOK_ENTRY"] = float(cfg2["MAX_P_TANGIBLE_BOOK_ENTRY"]) * 1.25
+    if cfg2.get("MIN_NCAV_RATIO_ENTRY") is not None:
+        cfg2["MIN_NCAV_RATIO_ENTRY"] = float(cfg2["MIN_NCAV_RATIO_ENTRY"]) * 0.8
+
+    relaxed2 = _apply_graham_filters(df, cfg2)
+    pass2 = int(relaxed2["passes_all"].sum())
+    print(
+        f"[Deep_Value_Bot] Relaxation step 2 (looser MoS): "
+        f"{pass2} / {universe_size}."
+    )
+    if pass2 >= threshold:
+        return relaxed2
+
+    # Step 3: MoS-only and best-score fallback
+    fallback = relaxed2.copy()
+    if "mos_pass" in fallback.columns:
+        fallback["passes_all"] = fallback["mos_pass"]
+        pass3 = int(fallback["passes_all"].sum())
+        print(
+            f"[Deep_Value_Bot] Relaxation step 3 (MoS-only): "
+            f"{pass3} / {universe_size}."
+        )
+    else:
+        pass3 = 0
+
+    if pass3 >= threshold:
+        return fallback
+
+    # Hard fallback: force at least N best-score names as candidates
+    if "score" in fallback.columns:
+        fallback_sorted = fallback.sort_values("score")
+    else:
+        fallback_sorted = fallback.copy()
+
+    n_force = min(max(10, threshold), len(fallback_sorted))
+    force_idx = fallback_sorted.index[:n_force]
+    fallback.loc[:, "passes_all"] = False
+    fallback.loc[force_idx, "passes_all"] = True
+    print(
+        f"[Deep_Value_Bot] Hard fallback: forcing top {n_force} by score as candidates "
+        f"on {as_of_date.date()}."
+    )
+
+    return fallback
+
 def run_screen(
     as_of_date,
     universe_override: Optional[List[str]] = None,
@@ -457,28 +596,10 @@ def run_screen(
     """
     Run the deep value screen as of `as_of_date`.
 
-    Parameters
-    ----------
-    as_of_date : pd.Timestamp | str
-    universe_override : list[str] or None
-        If provided, use this universe instead of config-driven universe.
-    mode : {"filtered", "raw"}
-        "raw"      -> return all names with mos/quality flags.
-        "filtered" -> only names where passes_all == True.
-    config : dict | None
-        Optional override of GRAHAM_CONFIG keys.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns include at least:
-            - ticker
-            - symbol
-            - marketCap, totalAssets, ...
-            - p_tangible_book, ncav, ncav_ratio,
-            - debt_to_equity_proxy, current_ratio, debt_to_assets
-            - score
-            - mos_pass, quality_pass, passes_all
+    Guarantees:
+      - Universe is cleaned.
+      - Graham filters are applied with adaptive relaxation.
+      - Never silently returns zero candidates in 'filtered' mode.
     """
     if not isinstance(as_of_date, pd.Timestamp):
         as_of_date = pd.to_datetime(as_of_date)
@@ -494,7 +615,9 @@ def run_screen(
     # Universe selection
     # ---------------------------
     if universe_override is not None:
-        universe = list(universe_override)
+        universe_raw = [str(s).strip().upper() for s in universe_override if s]
+        print(f"[Deep_Value_Bot] Using override universe of {len(universe_raw)} symbols.")
+        universe = sorted(set(universe_raw))
     else:
         universe_source = cfg.get("UNIVERSE_SOURCE")
         if universe_source == "nasdaq":
@@ -502,24 +625,27 @@ def run_screen(
         else:
             raise ValueError(
                 f"Unsupported UNIVERSE_SOURCE={universe_source!r}. "
-                "Use 'sp_mid_small' or 'nasdaq'."
+                "Use 'nasdaq' (S&P mid/small source not implemented here)."
             )
 
     if not universe:
         raise RuntimeError("Universe is empty; cannot run screen.")
 
     # Fundamentals + metrics
-    fund_df = _download_fundamentals(universe)
-    val_df = _compute_value_metrics(fund_df)
-    val_df = _apply_graham_filters(val_df, cfg)
+    fund_df = _download_fundamentals(universe, max_tickers=None)
+    if fund_df.empty:
+        raise RuntimeError("[Deep_Value_Bot] Fundamental DataFrame is empty after download.")
 
-    # Some transparency stats
+    val_df = _compute_value_metrics(fund_df)
+    val_df = _apply_graham_filters_with_relaxation(val_df, cfg, as_of_date=as_of_date)
+
+    # Transparency stats
     raw_count = len(val_df)
-    mos_count = int(val_df["mos_pass"].sum())
-    quality_count = int(val_df["passes_all"].sum())
+    mos_count = int(val_df.get("mos_pass", False).sum()) if "mos_pass" in val_df.columns else 0
+    quality_count = int(val_df.get("passes_all", False).sum()) if "passes_all" in val_df.columns else 0
     print(
-        f"[Deep_Value_Bot] Raw universe: {raw_count} names | "
-        f"MoS pass: {mos_count} | MoS+quality pass: {quality_count}"
+        f"[Deep_Value_Bot] {as_of_date.date()} | Raw universe: {raw_count} names | "
+        f"MoS pass: {mos_count} | Final passes_all: {quality_count}"
     )
 
     # Reset index -> have ticker and symbol columns
@@ -533,7 +659,12 @@ def run_screen(
 
     # Apply mode
     if mode == "filtered":
+        before = len(out)
         out = out[out["passes_all"]].copy()
+        after = len(out)
+        print(
+            f"[Deep_Value_Bot] Filtered mode: {before} -> {after} names with passes_all=True."
+        )
 
     # Rank by cheapness
     if "score" in out.columns:

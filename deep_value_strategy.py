@@ -132,6 +132,7 @@ class DeepValueStrategy(Strategy):
             f"min_holding_days={self.min_holding_days}"
         )
 
+
     def on_bar(
         self,
         broker: Broker,
@@ -155,6 +156,8 @@ class DeepValueStrategy(Strategy):
         if not self._is_rebalance_idx(bar_idx):
             return
 
+        print(f"[DeepValueStrategy] Rebalance trigger at index {bar_idx}, date {ts.date()}.")
+
         # ---------------------------
         # 1) Run deep value screen (raw)
         # ---------------------------
@@ -166,10 +169,13 @@ class DeepValueStrategy(Strategy):
             )
         except Exception as e:
             print(f"[DeepValueStrategy] run_screen failed on {ts.date()}: {e}")
+            # Even on failure, record that we attempted this rebalance index
+            self._last_rebalance_idx = bar_idx
             return
 
         if screen_df is None or screen_df.empty:
             print("[DeepValueStrategy] Screener returned no data; skipping bar.")
+            self._last_rebalance_idx = bar_idx
             return
 
         # Identify symbol column
@@ -181,26 +187,28 @@ class DeepValueStrategy(Strategy):
 
         if symbol_col is None:
             print("[DeepValueStrategy] Screener output missing symbol/ticker column; skipping bar.")
+            self._last_rebalance_idx = bar_idx
             return
 
         # Restrict candidates to symbols that exist in our price universe
+        before_ct = len(screen_df)
         if slice_df is not None and not slice_df.empty:
             traded_universe = set(map(str, slice_df.columns))
-            before_ct = len(screen_df)
             screen_df = screen_df[
                 screen_df[symbol_col].astype(str).isin(traded_universe)
             ].copy()
-            after_ct = len(screen_df)
+        after_ct = len(screen_df)
+        print(
+            f"[DeepValueStrategy] Universe restricted to traded names: "
+            f"{before_ct} -> {after_ct}"
+        )
+        if screen_df.empty:
             print(
-                f"[DeepValueStrategy] Universe restricted to traded names: "
-                f"{before_ct} -> {after_ct}"
+                f"[DeepValueStrategy] Screener produced {before_ct} names on {ts.date()} "
+                "but none are in the price universe; staying in cash."
             )
-            if screen_df.empty:
-                print(
-                    f"[DeepValueStrategy] Screener produced {before_ct} names on {ts.date()} "
-                    "but none are in the price universe; skipping bar."
-                )
-                return
+            self._last_rebalance_idx = bar_idx
+            return
 
         # Use symbol as index for quick lookup
         screen_df[symbol_col] = screen_df[symbol_col].astype(str)
@@ -226,9 +234,13 @@ class DeepValueStrategy(Strategy):
         exit_on_missing = self.cfg.get("EXIT_ON_MISSING_FUNDAMENTALS", True)
 
         for sym in list(current_symbols):
+            reason_parts = []
+
             if sym not in screen_df.index:
                 if exit_on_missing:
                     forced_sells.add(sym)
+                    reason_parts.append("missing in screen")
+                # if not exiting on missing, we simply skip further checks
                 continue
 
             row = screen_df.loc[sym]
@@ -237,14 +249,16 @@ class DeepValueStrategy(Strategy):
             quality_pass = bool(row.get("quality_pass", False))
 
             value_exit = False
-            if max_ptb_exit is not None and not np.isnan(ptb):
-                if ptb > float(max_ptb_exit):
-                    value_exit = True
-            if min_ncav_exit is not None and not np.isnan(ncav_ratio):
-                if ncav_ratio < float(min_ncav_exit):
-                    value_exit = True
+            if max_ptb_exit is not None and not np.isnan(ptb) and ptb > float(max_ptb_exit):
+                value_exit = True
+                reason_parts.append(f"p_tangible_book {ptb:.2f} > {max_ptb_exit}")
+            if min_ncav_exit is not None and not np.isnan(ncav_ratio) and ncav_ratio < float(min_ncav_exit):
+                value_exit = True
+                reason_parts.append(f"ncav_ratio {ncav_ratio:.2f} < {min_ncav_exit}")
 
             quality_exit = not quality_pass
+            if quality_exit:
+                reason_parts.append("quality_pass=False")
 
             days_held = self._days_held(sym, ts)
             min_hold_ok = (
@@ -253,8 +267,13 @@ class DeepValueStrategy(Strategy):
 
             if quality_exit or (value_exit and min_hold_ok):
                 forced_sells.add(sym)
+                print(
+                    f"[DeepValueStrategy] {ts.date()} FORCED SELL CANDIDATE {sym} "
+                    f"(held {days_held} days, reasons: {', '.join(reason_parts)})"
+                )
 
         # Execute forced sells
+        pre_trades = len(broker.trades)
         for sym in forced_sells:
             qty = broker.get_position(sym)
             if qty > 0:
@@ -297,7 +316,7 @@ class DeepValueStrategy(Strategy):
 
         target_symbols = list(sorted(current_symbols | set(new_buys)))
         if not target_symbols:
-            print(f"[DeepValueStrategy] {ts.date()} | No holdings; staying in cash.")
+            print(f"[DeepValueStrategy] {ts.date()} | No holdings; staying in cash on this rebalance.")
             self._last_rebalance_idx = bar_idx
             return
 
@@ -305,8 +324,8 @@ class DeepValueStrategy(Strategy):
         # 4) Rebalance holdings to equal weight
         # ---------------------------
         equity = self._compute_equity(broker, market)
-        if equity <= 0:
-            print(f"[DeepValueStrategy] {ts.date()} | Non-positive equity, skipping rebalance.")
+        if equity <= 0 or not np.isfinite(equity):
+            print(f"[DeepValueStrategy] {ts.date()} | Non-positive or invalid equity ({equity}), skipping rebalance.")
             self._last_rebalance_idx = bar_idx
             return
 
@@ -316,6 +335,10 @@ class DeepValueStrategy(Strategy):
         for sym in target_symbols:
             price = market.get_price(sym)
             if price is None or not np.isfinite(price) or price <= 0:
+                print(
+                    f"[DeepValueStrategy] {ts.date()} | Skipping {sym} in rebalance "
+                    f"(invalid price: {price})."
+                )
                 continue
 
             current_qty = broker.get_position(sym)
@@ -330,8 +353,13 @@ class DeepValueStrategy(Strategy):
             elif shares_to_trade < 0:
                 broker.sell(ts, sym, -shares_to_trade)
 
+        post_trades = len(broker.trades)
+        if post_trades == pre_trades:
+            print(f"[DeepValueStrategy] {ts.date()} | Rebalance produced zero trades (already near equal weight).")
+
         # Record this bar as the latest rebalance
         self._last_rebalance_idx = bar_idx
+
 
     def on_end(self, broker: Broker, market: Market) -> None:
         """

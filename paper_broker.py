@@ -110,13 +110,16 @@ class Broker:
             return
 
         symbol = str(symbol)
-        qty = int(quantity)
-        side = "BUY" if qty > 0 else "SELL"
-        qty = abs(qty)
+        qty_signed = int(quantity)
+        side = "BUY" if qty_signed > 0 else "SELL"
+        qty = abs(qty_signed)
 
         price = self.market.get_price(symbol)
         if price is None or not np.isfinite(price) or price <= 0:
-            # No valid price -> cannot trade
+            print(
+                f"[Broker] {ts} | Cannot {side} {symbol} (invalid price: {price}). "
+                "Trade skipped."
+            )
             return
 
         commission = self._calc_commission(qty, price)
@@ -130,7 +133,10 @@ class Broker:
         if side == "BUY":
             cost = qty * price + commission
             if self.cash < cost:
-                # insufficient buying power
+                print(
+                    f"[Broker] {ts} | Insufficient cash to BUY {qty} {symbol} "
+                    f"at {price:.4f} (cost {cost:.2f}, cash {self.cash:.2f}). Trade skipped."
+                )
                 return
 
             if prev_pos is None:
@@ -138,7 +144,10 @@ class Broker:
             else:
                 total_shares = prev_pos.quantity + qty
                 if total_shares <= 0:
-                    # should not happen for buys, but guard anyway
+                    print(
+                        f"[Broker] {ts} | Inconsistent position state on BUY for {symbol}; "
+                        f"current qty {prev_pos.quantity}, attempting BUY {qty}. Trade skipped."
+                    )
                     return
                 new_avg = (prev_pos.avg_price * prev_pos.quantity + price * qty) / total_shares
                 prev_pos.quantity = total_shares
@@ -151,7 +160,10 @@ class Broker:
         # ---------------------------
         else:
             if prev_pos is None or prev_pos.quantity <= 0 or prev_pos.quantity < qty:
-                # no position or trying to go short -> disallow
+                print(
+                    f"[Broker] {ts} | Cannot SELL {qty} {symbol}; "
+                    f"position qty={0 if prev_pos is None else prev_pos.quantity}. Trade skipped."
+                )
                 return
 
             # Realized PnL based on position's avg_price
@@ -203,14 +215,30 @@ class Broker:
     def mark_to_market(self, ts: pd.Timestamp) -> None:
         """
         Compute current equity at timestamp `ts` and append to history.
+
+        Invariant:
+            equity ≈ cash + Σ(position.quantity * price)
         """
         positions_value = 0.0
         for pos in self.positions.values():
             price = self.market.get_price(pos.symbol)
             if price is not None and np.isfinite(price):
                 positions_value += pos.quantity * price
+            else:
+                # If we can't price a position, we treat it as zero-value and log.
+                print(
+                    f"[Broker] {ts} | Missing/invalid price for {pos.symbol} in mark_to_market; "
+                    "treating as zero for now."
+                )
 
         equity = float(self.cash) + positions_value
+
+        if not np.isfinite(equity) or equity < -1e-6:
+            print(
+                f"[Broker] {ts} | WARNING: equity invariant violated or invalid "
+                f"(equity={equity}, cash={self.cash}, positions_value={positions_value})."
+            )
+
         self.equity_history.append(
             {
                 "timestamp": pd.to_datetime(ts),
