@@ -260,7 +260,15 @@ class Strategy(ABC):
         broker: Broker,
         market: Market,
         calendar: List[pd.Timestamp],
+        filing_events_by_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
     ) -> None:
+        """
+        Called once before the backtest loop starts.
+
+        filing_events_by_date:
+            Optional mapping from date -> set of symbols that have
+            a filing-effective decision on that trading day.
+        """
         ...
 
     @abstractmethod
@@ -270,13 +278,20 @@ class Strategy(ABC):
         market: Market,
         ts: pd.Timestamp,
         slice_df: pd.DataFrame,
+        filing_symbols_today: Optional[set[str]] = None,
     ) -> None:
+        """
+        Called once per bar in the trading calendar.
+
+        filing_symbols_today:
+            Optional set of symbols that have a filing-driven decision
+            on this bar (effective_trade_date).
+        """
         ...
 
     @abstractmethod
     def on_end(self, broker: Broker, market: Market) -> None:
         ...
-
 
 # ----------------------------------------------------------------------
 # Backtest loop
@@ -287,9 +302,10 @@ def run_backtest(
     strategy: Strategy,
     broker: Broker,
     market: Market,
+    filing_events_by_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
 ) -> Broker:
     """
-    Generic backtest loop.
+    Generic backtest loop with optional SEC filing event support.
 
     Parameters
     ----------
@@ -304,38 +320,50 @@ def run_backtest(
         Broker instance.
     market : Market
         Market instance.
+    filing_events_by_date : dict[pd.Timestamp, set[str]] | None
+        Optional mapping from effective_trade_date (normalized date) to
+        the set of symbols with filing-driven decision events on that day.
 
     Returns
     -------
     Broker
         The same broker instance, for convenience.
     """
-    # Ensure datetime index
     prices = prices.copy()
     prices.index = pd.to_datetime(prices.index)
     calendar = [pd.to_datetime(d) for d in calendar]
 
-    strategy.on_start(broker, market, calendar)
+    # Normalize keys of filing_events_by_date to date-only for robust lookup
+    norm_events = None
+    if filing_events_by_date:
+        norm_events = {}
+        for dt, syms in filing_events_by_date.items():
+            key = pd.to_datetime(dt).normalize()
+            norm_events.setdefault(key, set()).update({str(s).upper() for s in syms})
+
+    strategy.on_start(broker, market, calendar, norm_events)
 
     for ts in calendar:
         if ts not in prices.index:
-            # No data for this day (holiday, etc.)
             continue
 
-        # Update market snapshot for this bar
         price_series = prices.loc[ts]
         market.update(price_series)
 
-        # Historical slice up to current ts
         slice_df = prices.loc[:ts]
 
-        # Let the strategy trade
-        strategy.on_bar(broker, market, ts, slice_df)
+        filing_syms_today: Optional[set[str]] = None
+        if norm_events is not None:
+            filing_syms_today = norm_events.get(ts.normalize(), set())
+            if filing_syms_today:
+                print(
+                    f"[run_backtest] {ts.date()} | Filing-driven decision day for "
+                    f"{len(filing_syms_today)} symbols."
+                )
 
-        # Mark-to-market at close
+        strategy.on_bar(broker, market, ts, slice_df, filing_syms_today)
+
         broker.mark_to_market(ts)
 
-    # Final callback
     strategy.on_end(broker, market)
-
     return broker

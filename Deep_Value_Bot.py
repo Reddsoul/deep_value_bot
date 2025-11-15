@@ -47,27 +47,26 @@ from io import StringIO  # for pd.read_html on literal html strings
 # ----------------------------------------------------------------------
 GRAHAM_CONFIG: Dict[str, object] = {
     # --- Entry thresholds (margin of safety & quality) ---
-    # Margin of safety: cheap vs book and NCAV
-    "MAX_P_TANGIBLE_BOOK_ENTRY": 0.8,   # buy only if <= 0.8x tangible book
-    "MIN_NCAV_RATIO_ENTRY": 0.5,        # NCAV / marketCap >= 0.5 (~ P <= 2 * NCAV)
+    # Slightly looser for full NASDAQ, still Graham-ish conservative.
+    "MAX_P_TANGIBLE_BOOK_ENTRY": 1.1,    # was 0.8
+    "MIN_NCAV_RATIO_ENTRY": 0.33,        # was 0.5; ~P <= 3x NCAV
 
     # Financial strength / liquidity
-    "MIN_CURRENT_RATIO_ENTRY": 1.5,     # current assets / current liabilities
-    "MAX_DEBT_TO_ASSETS_ENTRY": 0.5,    # totalDebt / totalAssets
-    "MAX_DEBT_TO_MARKET_CAP_ENTRY": 1.0,  # totalDebt / marketCap
+    "MIN_CURRENT_RATIO_ENTRY": 1.5,
+    "MAX_DEBT_TO_ASSETS_ENTRY": 0.7,     # was 0.5
+    "MAX_DEBT_TO_MARKET_CAP_ENTRY": 1.5, # was 1.0
 
     # Earnings
-    "REQUIRE_POSITIVE_EARNINGS_ENTRY": True,  # trailing EPS must be > 0
+    "REQUIRE_POSITIVE_EARNINGS_ENTRY": True,
 
     # --- Exit thresholds (looser than entry, to avoid whipsaw) ---
-    "MAX_P_TANGIBLE_BOOK_EXIT": 1.2,    # consider overvalued if > 1.2x TB
-    "MIN_NCAV_RATIO_EXIT": 0.3,         # consider undervalued lost if < 0.3
+    "MAX_P_TANGIBLE_BOOK_EXIT": 1.6,
+    "MIN_NCAV_RATIO_EXIT": 0.2,
 
     # --- Data handling behavior ---
     "ALLOW_MISSING_METRICS": False,
     "EXIT_ON_MISSING_FUNDAMENTALS": True,
 
-    # Columns required to consider a name investable
     "REQUIRED_MOS_COLS": ["p_tangible_book", "ncav_ratio"],
     "REQUIRED_QUALITY_COLS": [
         "current_ratio",
@@ -76,10 +75,11 @@ GRAHAM_CONFIG: Dict[str, object] = {
         "trailingEps",
     ],
 
-    # --- Universe selection ---
-    # "sp_mid_small" -> S&P 400 + 600 mid/small caps (current behavior)
-    # "nasdaq"       -> current NASDAQ ticker list via yfinance
-    "UNIVERSE_SOURCE": "sp_mid_small",
+    # Universe selection
+    "UNIVERSE_SOURCE": "nasdaq",
+
+    # Fundamentals backend: "yfinance" or "sec_xbrl"
+    "FUNDAMENTALS_BACKEND": "yfinance",
 }
 
 _FUND_CACHE: Dict[str, Dict[str, object]] = {}
@@ -221,7 +221,7 @@ def _chunked(iterable: Iterable[str], batch_size: int) -> Iterable[List[str]]:
 
 def _safe_fetch_info(
     symbol: str,
-    max_retries: int = 5,
+    max_retries: int = 10,
     base_sleep: float = 1.0,
 ) -> Dict[str, object]:
     """
@@ -276,6 +276,56 @@ def _safe_fetch_info(
     return {}
 
 def _download_fundamentals(
+    tickers: List[str],
+    as_of_date: Optional[pd.Timestamp] = None,
+    backend: str = "yfinance",
+    max_tickers: Optional[int] = None,  # None = use full list
+) -> pd.DataFrame:
+    """
+    Download fundamental data for a list of tickers.
+
+    Parameters
+    ----------
+    tickers : list[str]
+        Universe of tickers.
+    as_of_date : pd.Timestamp | None
+        Point-in-time date; for yfinance this is currently unused, but kept
+        in the signature so the sec_xbrl backend can be truly point-in-time.
+    backend : {"yfinance", "sec_xbrl"}
+        Select fundamentals source.
+    max_tickers : int | None
+        Optional dev cap for universe size.
+
+    Returns
+    -------
+    pd.DataFrame
+        Index = ticker, columns include marketCap, totalAssets, totalLiab,
+        netTangibleAssets, cash, totalDebt, totalCurrentAssets,
+        totalCurrentLiabilities, trailingEps, plus derived metrics.
+    """
+    if not tickers:
+        raise ValueError("_download_fundamentals: empty ticker list")
+
+    if not isinstance(as_of_date, pd.Timestamp) and as_of_date is not None:
+        as_of_date = pd.to_datetime(as_of_date)
+
+    backend = (backend or "yfinance").lower()
+
+    if backend == "yfinance":
+        return _download_fundamentals_yfinance(
+            tickers=tickers,
+            max_tickers=max_tickers,
+        )
+    elif backend == "sec_xbrl":
+        return _download_fundamentals_sec_xbrl(
+            tickers=tickers,
+            as_of_date=as_of_date,
+            max_tickers=max_tickers,
+        )
+    else:
+        raise ValueError(f"Unsupported fundamentals backend: {backend!r}")
+
+def _download_fundamentals_yfinance(
     tickers: List[str],
     max_tickers: Optional[int] = None,  # None = use full list
 ) -> pd.DataFrame:
@@ -373,6 +423,55 @@ def _download_fundamentals(
     df["current_ratio"] = np.where(cl > 0, ca / cl, np.nan)
 
     return df
+
+def _download_fundamentals_sec_xbrl(
+    tickers: List[str],
+    as_of_date: Optional[pd.Timestamp],
+    max_tickers: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    SEC EDGAR XBRL fundamentals backend (Backend B).
+
+    This is a *structured stub* that you can progressively fill in with
+    real EDGAR logic.
+
+    Design:
+      1) Map each ticker -> CIK.
+      2) For each CIK, query company facts (XBRL) from EDGAR.
+      3) For each desired metric (totalAssets, totalLiabilities, etc),
+         choose the latest fact where:
+             filed_date <= as_of_date
+             AND (effective date <= as_of_date, if available)
+      4) Construct a DataFrame aligned with the yfinance backend schema.
+
+    NOTE:
+      - This function must obey SEC's fair access requirements, including
+        a proper User-Agent and rate limits.
+      - Here we only provide a skeleton and conservative defaults; you
+        will need to implement the actual HTTP calls and JSON parsing.
+    """
+    if not tickers:
+        raise ValueError("_download_fundamentals_sec_xbrl: empty ticker list")
+
+    if as_of_date is None:
+        raise ValueError("sec_xbrl backend requires as_of_date for point-in-time logic.")
+
+    uniq_all = sorted({str(t).strip().upper() for t in tickers if t})
+    if max_tickers is not None and len(uniq_all) > max_tickers:
+        print(
+            f"[Deep_Value_Bot] SEC backend: truncating universe from "
+            f"{len(uniq_all)} to {max_tickers} tickers for this run."
+        )
+        uniq = uniq_all[:max_tickers]
+    else:
+        uniq = uniq_all
+
+    # Placeholder: for now, raise NotImplementedError so you don't forget
+    # to implement the SEC logic before switching FUNDAMENTALS_BACKEND.
+    raise NotImplementedError(
+        "sec_xbrl backend is wired but not yet implemented. "
+        "Implement EDGAR companyfacts fetching here."
+    )
 
 def _compute_value_metrics(fund_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -497,25 +596,26 @@ def _apply_graham_filters_with_relaxation(
     df: pd.DataFrame,
     cfg: Dict[str, object],
     as_of_date: pd.Timestamp,
-    min_frac: float = 0.001,
-    min_abs: int = 3,
+    min_frac: float = 0.02,
+    min_abs: int = 50,
 ) -> pd.DataFrame:
     """
     Apply Graham filters with adaptive relaxation so we never end up with
-    zero (or near-zero) candidates silently.
+    zero (or near-zero) candidates.
 
-    Steps:
-      0) Strict filters (current cfg).
-      1) Allow missing metrics, drop positive EPS requirement.
-      2) Relax MoS thresholds slightly.
-      3) If still too few, fall back to MoS-only and then best-score selection.
+    Target behavior:
+      - On a NASDAQ-like universe, aim for at least ~50 candidates.
+      - Prefer 2–10% of the universe passing, but never 0.
+      - Use strict Graham logic first, then progressively relax.
     """
+    df = df.copy()
     base = _apply_graham_filters(df, cfg)
     universe_size = len(base)
     if universe_size == 0:
         print("[Deep_Value_Bot] Graham filter: empty universe; returning empty DataFrame.")
         return base
 
+    # At least min_abs or min_frac of the universe, whichever is larger.
     threshold = max(min_abs, int(np.ceil(min_frac * universe_size)))
     strict_pass = int(base["passes_all"].sum())
     print(
@@ -526,7 +626,7 @@ def _apply_graham_filters_with_relaxation(
     if strict_pass >= threshold:
         return base
 
-    # Step 1: Allow missing metrics + drop positive EPS requirement
+    # Step 1: allow missing metrics, drop positive EPS requirement
     cfg1 = dict(cfg)
     cfg1["ALLOW_MISSING_METRICS"] = True
     cfg1["REQUIRE_POSITIVE_EARNINGS_ENTRY"] = False
@@ -539,7 +639,7 @@ def _apply_graham_filters_with_relaxation(
     if pass1 >= threshold:
         return relaxed1
 
-    # Step 2: Relax MoS thresholds slightly
+    # Step 2: relax MoS thresholds slightly
     cfg2 = dict(cfg1)
     if cfg2.get("MAX_P_TANGIBLE_BOOK_ENTRY") is not None:
         cfg2["MAX_P_TANGIBLE_BOOK_ENTRY"] = float(cfg2["MAX_P_TANGIBLE_BOOK_ENTRY"]) * 1.25
@@ -570,13 +670,14 @@ def _apply_graham_filters_with_relaxation(
     if pass3 >= threshold:
         return fallback
 
-    # Hard fallback: force at least N best-score names as candidates
+    # Hard fallback: force at least 50 best-score names
     if "score" in fallback.columns:
         fallback_sorted = fallback.sort_values("score")
     else:
         fallback_sorted = fallback.copy()
 
-    n_force = min(max(10, threshold), len(fallback_sorted))
+    forced_min = max(50, threshold)
+    n_force = min(forced_min, len(fallback_sorted))
     force_idx = fallback_sorted.index[:n_force]
     fallback.loc[:, "passes_all"] = False
     fallback.loc[force_idx, "passes_all"] = True
@@ -593,24 +694,16 @@ def run_screen(
     mode: str = "filtered",
     config: Optional[Dict[str, object]] = None,
 ) -> pd.DataFrame:
-    """
-    Run the deep value screen as of `as_of_date`.
-
-    Guarantees:
-      - Universe is cleaned.
-      - Graham filters are applied with adaptive relaxation.
-      - Never silently returns zero candidates in 'filtered' mode.
-    """
+    # ...
     if not isinstance(as_of_date, pd.Timestamp):
         as_of_date = pd.to_datetime(as_of_date)
 
     print(f"[Deep_Value_Bot] Running deep value screen as of {as_of_date.date()}...")
 
-    # Configure thresholds
     cfg = dict(GRAHAM_CONFIG)
     if config:
         cfg.update(config)
-
+        
     # ---------------------------
     # Universe selection
     # ---------------------------
@@ -632,7 +725,15 @@ def run_screen(
         raise RuntimeError("Universe is empty; cannot run screen.")
 
     # Fundamentals + metrics
-    fund_df = _download_fundamentals(universe, max_tickers=None)
+    fundamentals_backend = str(cfg.get("FUNDAMENTALS_BACKEND", "yfinance")).lower()
+    print(f"[Deep_Value_Bot] Using fundamentals backend: {fundamentals_backend}")
+
+    fund_df = _download_fundamentals(
+        universe,
+        as_of_date=as_of_date,
+        backend=fundamentals_backend,
+        max_tickers=None,
+    )
     if fund_df.empty:
         raise RuntimeError("[Deep_Value_Bot] Fundamental DataFrame is empty after download.")
 

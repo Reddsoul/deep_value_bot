@@ -32,11 +32,11 @@ import time  # NEW
 # ----------------------------------------------------------------------
 CONFIG: Dict[str, object] = {
     # Backtest window
-    "start": "2024-01-01",
+    "start": "2025-01-01",
     "end": date.today().strftime("%Y-%m-%d"),
 
     # Portfolio
-    "initial_cash": 5000.00,
+    "initial_cash": 100000.00,
     "max_positions": 20,
 
     # Rebalancing / holding period
@@ -50,6 +50,9 @@ CONFIG: Dict[str, object] = {
     # Commissions
     "commission_per_share": 0.005,
     "min_commission": 0.50,
+
+    # Optional SEC filings CSV (symbol, filing_type, filing_date, effective_trade_date)
+    "sec_filings_csv": None,  # e.g. "sec_filings.csv"
 }
 
 # DEV/EXPERIMENTAL: limit universe size for speed during development
@@ -94,6 +97,38 @@ def filter_universe_by_price_history(
         f"symbols with >= {min_history_days} days of data."
     )
     return filtered
+
+def build_filing_events_by_date(filings_df: pd.DataFrame) -> Dict[pd.Timestamp, set[str]]:
+    """
+    Build filing_events_by_date from a DataFrame with columns:
+        symbol, filing_type, filing_date, effective_trade_date
+
+    Returns
+    -------
+    dict[pd.Timestamp, set[str]]
+        Mapping from effective_trade_date (normalized) to the set of symbols
+        with filing-driven decision events that day.
+    """
+    required_cols = {"symbol", "filing_type", "filing_date", "effective_trade_date"}
+    missing = required_cols - set(filings_df.columns)
+    if missing:
+        raise ValueError(f"filings_df missing required columns: {missing}")
+
+    df = filings_df.copy()
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    df["filing_date"] = pd.to_datetime(df["filing_date"])
+    df["effective_trade_date"] = pd.to_datetime(df["effective_trade_date"])
+
+    events: Dict[pd.Timestamp, set[str]] = {}
+    for eff_date, group in df.groupby(df["effective_trade_date"].dt.normalize()):
+        syms = set(group["symbol"].tolist())
+        events[pd.to_datetime(eff_date)] = syms
+
+    print(
+        f"[Run_Backtest] SEC filing events: {len(events)} effective_trade_dates, "
+        f"{len(df)} total filing rows."
+    )
+    return events
 
 _PRICE_CACHE: Dict[Tuple[Tuple[str, ...], str, str], pd.DataFrame] = {}
 
@@ -362,6 +397,16 @@ def main(config: Dict[str, object]) -> None:
     commission_per_share = float(config["commission_per_share"])
     min_commission = float(config["min_commission"])
 
+    # Optional: SEC filing events
+    sec_filings_csv = config.get("sec_filings_csv")
+    filing_events_by_date = None
+    if sec_filings_csv:
+        print(f"[Run_Backtest] Loading SEC filings from {sec_filings_csv!r}...")
+        filings_df = pd.read_csv(sec_filings_csv)
+        filing_events_by_date = build_filing_events_by_date(filings_df)
+    else:
+        print("[Run_Backtest] No sec_filings_csv specified; running without filing events.")
+
     start_dt = pd.to_datetime(start_str)
     end_dt = pd.to_datetime(end_str)
     if end_dt < start_dt:
@@ -436,6 +481,7 @@ def main(config: Dict[str, object]) -> None:
         strategy=strategy,
         broker=broker,
         market=market,
+        filing_events_by_date=filing_events_by_date,
     )
     print("[Run_Backtest] Backtest complete.")
 
